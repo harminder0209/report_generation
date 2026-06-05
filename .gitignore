@@ -1,0 +1,6 @@
+# Ignore everything by default
+/*
+
+# Track only the generator and this ignore file
+!.gitignore
+!generate_report.py
