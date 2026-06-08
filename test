@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""
+pbix_perf_extract.py
+====================
+Read a Power BI .pbix file (or a folder of them) and extract everything needed
+to find performance problems, then run a rule-based detector.
+
+Two readers on one file:
+  * MODEL  side  -> pbixray            (tables, columns, DAX, M, relationships, sizes)
+  * REPORT side  -> zipfile + json     (visual types, slicer counts, field refs)
+                    handles BOTH the legacy single "Layout" blob (UTF-16) and the
+                    newer PBIR per-visual "visual.json" files. Also accepts an
+                    already-extracted PBIP/Report folder.
+
+Outputs, per input file:
+  <name>.facts.json    - the raw extracted facts (model + report)
+  <name>.findings.md   - the prioritised performance findings
+
+Usage:
+  python pbix_perf_extract.py report.pbix
+  python pbix_perf_extract.py ./folder_of_pbix/ -o ./out/
+  python pbix_perf_extract.py report.pbix --report-only ./SomeReport.Report  # visuals from a folder
+"""
+
+import argparse
+import json
+import re
+import sys
+import zipfile
+from pathlib import Path
+
+# --------------------------------------------------------------------------- #
+#  Helpers                                                                    #
+# --------------------------------------------------------------------------- #
+AUTO_TABLE_RE = re.compile(r"^(LocalDateTable_|DateTableTemplate_)", re.I)
+SLICER_WARN = 8          # slicers per page above this is flagged
+VISUALS_WARN = 20        # total visuals per page above this is flagged
+HIGH_CARD_WARN = 100_000 # column cardinality above this is flagged (if stats present)
+
+
+def _norm(d):
+    """Lower-case-key view of a dict so we can read pbixray columns defensively."""
+    return {str(k).lower(): v for k, v in d.items()}
+
+
+def _get(d, *names, default=None):
+    """Fetch the first matching key (case-insensitive, substring-tolerant)."""
+    nd = _norm(d)
+    for n in names:
+        n = n.lower()
+        if n in nd:
+            return nd[n]
+    for n in names:
+        n = n.lower()
+        for k, v in nd.items():
+            if n in k:
+                return v
+    return default
+
+
+# --------------------------------------------------------------------------- #
+#  MODEL extraction  (pbixray)                                                #
+# --------------------------------------------------------------------------- #
+def extract_model(pbix_path):
+    """Pull the data-model facts via pbixray. Returns {} with 'error' on failure."""
+    try:
+        from pbixray import PBIXRay
+    except ImportError:
+        return {"error": "pbixray not installed - run: pip install pbixray"}
+
+    try:
+        m = PBIXRay(str(pbix_path))
+    except Exception as e:                       # noqa: BLE001
+        return {"error": f"pbixray could not open the file: {e}"}
+
+    def records(attr):
+        try:
+            df = getattr(m, attr)
+        except Exception:                        # noqa: BLE001
+            return []
+        if df is None:
+            return []
+        try:
+            return df.to_dict("records")         # pandas DataFrame
+        except AttributeError:
+            try:
+                return list(df)                  # numpy array / list
+            except Exception:                    # noqa: BLE001
+                return []
+
+    def scalar(attr):
+        try:
+            return getattr(m, attr)
+        except Exception:                        # noqa: BLE001
+            return None
+
+    try:
+        tables = [str(t) for t in m.tables]
+    except Exception:                            # noqa: BLE001
+        tables = []
+
+    return {
+        "tables": tables,
+        "schema": records("schema"),
+        "dax_measures": records("dax_measures"),
+        "dax_columns": records("dax_columns"),
+        "power_query": records("power_query"),
+        "m_parameters": records("m_parameters"),
+        "relationships": records("relationships"),
+        "metadata": records("metadata"),
+        "statistics": records("statistics"),
+        "size_bytes": scalar("size"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  REPORT extraction  (zipfile + json)                                        #
+# --------------------------------------------------------------------------- #
+def _walk_field_refs(obj, tables, pairs):
+    """Recursively collect table names and (table, field) pairs from any visual config."""
+    if isinstance(obj, dict):
+        # queryRef like "Table.Column" or "Sum(Table.Column)"
+        qr = obj.get("queryRef")
+        if isinstance(qr, str):
+            mm = re.search(r"([^().]+)\.([^()]+)$", qr)
+            if mm:
+                t, f = mm.group(1).strip(), mm.group(2).strip()
+                tables.add(t)
+                pairs.add((t, f))
+        # SourceRef.Entity (PBIR / legacy)
+        ent = obj.get("Entity")
+        if isinstance(ent, str):
+            tables.add(ent)
+        for v in obj.values():
+            _walk_field_refs(v, tables, pairs)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_field_refs(v, tables, pairs)
+
+
+def _visual_record(visual_type, config_obj):
+    tables, pairs = set(), set()
+    _walk_field_refs(config_obj, tables, pairs)
+    return {
+        "type": visual_type or "unknown",
+        "tables": sorted(tables),
+        "fields": sorted(f"{t}.{f}" for t, f in pairs),
+    }
+
+
+def parse_pbir_visual(vjson):
+    """One PBIR visual.json dict -> visual record."""
+    v = vjson.get("visual", {}) or {}
+    vtype = v.get("visualType")
+    return _visual_record(vtype, vjson)
+
+
+def parse_layout_blob(raw_bytes):
+    """Legacy single 'Layout' entry -> list of page dicts."""
+    text = None
+    for enc in ("utf-16-le", "utf-16", "utf-8-sig", "utf-8"):
+        try:
+            text = raw_bytes.decode(enc)
+            json.loads(text)
+            break
+        except Exception:                        # noqa: BLE001
+            text = None
+    if text is None:
+        return {"pages": [], "error": "could not decode/parse Layout blob"}
+
+    layout = json.loads(text)
+    pages = []
+    for sec in layout.get("sections", []):
+        visuals = []
+        for vc in sec.get("visualContainers", []):
+            cfg = vc.get("config")
+            cfg_obj = {}
+            if isinstance(cfg, str):
+                try:
+                    cfg_obj = json.loads(cfg)
+                except Exception:                # noqa: BLE001
+                    cfg_obj = {}
+            elif isinstance(cfg, dict):
+                cfg_obj = cfg
+            vtype = (
+                cfg_obj.get("singleVisual", {}).get("visualType")
+                if isinstance(cfg_obj.get("singleVisual"), dict) else None
+            )
+            visuals.append(_visual_record(vtype, cfg_obj))
+        pages.append({"name": sec.get("displayName") or sec.get("name") or "page",
+                      "visuals": visuals})
+    return {"pages": pages}
+
+
+def _pages_from_pbir_files(file_iter):
+    """file_iter yields (page_name, visual_json_dict). Group into pages."""
+    page_map = {}
+    for page_name, vjson in file_iter:
+        page_map.setdefault(page_name, []).append(parse_pbir_visual(vjson))
+    return {"pages": [{"name": p, "visuals": v} for p, v in page_map.items()]}
+
+
+def extract_visuals(path):
+    """Accept a .pbix/.zip, or an extracted Report/PBIP folder."""
+    path = Path(path)
+
+    # ---- a folder: look for PBIR visual.json files ----
+    if path.is_dir():
+        vfiles = list(path.rglob("visuals/*/visual.json"))
+        if not vfiles:
+            vfiles = list(path.rglob("visual.json"))
+        if not vfiles:
+            return {"pages": [], "error": "no visual.json files in folder"}
+
+        def it():
+            for vf in vfiles:
+                # page name = the .../pages/<PAGE>/visuals/... segment
+                parts = vf.parts
+                page = "page"
+                if "pages" in parts:
+                    i = parts.index("pages")
+                    if i + 1 < len(parts):
+                        page = parts[i + 1]
+                try:
+                    yield page, json.loads(vf.read_text(encoding="utf-8"))
+                except Exception:                # noqa: BLE001
+                    continue
+        return _pages_from_pbir_files(it())
+
+    # ---- a zip / pbix ----
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception as e:                       # noqa: BLE001
+        return {"pages": [], "error": f"not a readable zip/pbix: {e}"}
+
+    with z:
+        names = z.namelist()
+        norm = [n.replace("\\", "/") for n in names]
+
+        # PBIR per-visual files packed inside?
+        vis = [n for n, nn in zip(names, norm)
+               if nn.endswith("visual.json") and "/visuals/" in nn]
+        if vis:
+            def it():
+                for n in vis:
+                    nn = n.replace("\\", "/").split("/")
+                    page = "page"
+                    if "pages" in nn:
+                        i = nn.index("pages")
+                        if i + 1 < len(nn):
+                            page = nn[i + 1]
+                    try:
+                        yield page, json.loads(z.read(n).decode("utf-8"))
+                    except Exception:            # noqa: BLE001
+                        continue
+            return _pages_from_pbir_files(it())
+
+        # legacy single Layout blob
+        layout_name = None
+        for n, nn in zip(names, norm):
+            if nn.split("/")[-1].lower() == "layout":
+                layout_name = n
+                break
+        if layout_name:
+            return parse_layout_blob(z.read(layout_name))
+
+    return {"pages": [], "error": "no report layout (Layout blob or visual.json) found"}
+
+
+# --------------------------------------------------------------------------- #
+#  DETECTION RULES                                                            #
+# --------------------------------------------------------------------------- #
+def _expr_text(rec, *keys):
+    val = _get(rec, *keys, default="")
+    if isinstance(val, list):
+        val = " ".join(map(str, val))
+    return str(val or "")
+
+
+def detect(model, report):
+    findings = []
+
+    def add(sev, key, title, detail):
+        findings.append({"severity": sev, "key": key, "title": title, "detail": detail})
+
+    tables = model.get("tables", []) or []
+    user_tables = [t for t in tables if not AUTO_TABLE_RE.match(t)]
+
+    # 1. auto date/time -------------------------------------------------------
+    auto = [t for t in tables if AUTO_TABLE_RE.match(t)]
+    ti_on = False
+    for md in model.get("metadata", []):
+        blob = " ".join(f"{k}={v}" for k, v in md.items())
+        if "timeintelligenceenabled" in blob.lower() and re.search(r"enabled[^0-9]*1", blob.lower()):
+            ti_on = True
+    if auto or ti_on:
+        add("HIGH", "auto_datetime",
+            "Auto date/time hidden tables",
+            f"{len(auto)} auto date table(s) detected ({', '.join(auto[:4])}"
+            f"{'...' if len(auto) > 4 else ''}). They add hidden calculated date "
+            "tables/columns to the cache. Disable via Options > Data Load if no "
+            "visual uses a date hierarchy.")
+
+    # 2. relationships: bidirectional / many-to-many --------------------------
+    bi, m2m = [], []
+    for r in model.get("relationships", []):
+        xf = str(_get(r, "crossfilteringbehavior", "crossfilter", "behavior", default="")).lower()
+        card = str(_get(r, "cardinality", "tocardinality", default="")).lower()
+        ft = _get(r, "fromtable", "fromtablename", default="?")
+        tt = _get(r, "totable", "totablename", default="?")
+        label = f"{ft} -> {tt}"
+        if "both" in xf or xf in ("2", "bidirectional"):
+            bi.append(label)
+        if "many" in card and card.count("many") >= 2 or "m2m" in card or card == "manytomany":
+            m2m.append(label)
+    if m2m:
+        add("CRITICAL", "many_to_many",
+            "Many-to-many relationships",
+            f"{len(m2m)} M:M relationship(s): {', '.join(m2m[:5])}. Resolved at "
+            "query time via cross-filter expansion - expensive per interaction.")
+    if bi:
+        add("HIGH", "bidirectional",
+            "Bi-directional relationships",
+            f"{len(bi)} of {len(model.get('relationships', []))} relationship(s) are "
+            f"bi-directional: {', '.join(bi[:6])}{'...' if len(bi) > 6 else ''}. "
+            "Switch to single direction unless a slicer needs reverse filtering.")
+
+    # 3. calculated columns ---------------------------------------------------
+    agg_re = re.compile(r"\b(CALCULATE|RELATEDTABLE|SUMX|AVERAGEX|COUNTX|COUNTROWS|FILTER)\b", re.I)
+    label_re = re.compile(r"\b(SWITCH|IF)\b", re.I)
+    for c in model.get("dax_columns", []):
+        expr = _expr_text(c, "expression", "expr")
+        name = _get(c, "columnname", "name", "column", default="?")
+        tbl = _get(c, "tablename", "table", default="?")
+        if agg_re.search(expr):
+            add("HIGH", "calc_col_agg",
+                f"Expensive calculated column: {tbl}[{name}]",
+                "Aggregates/scans another table at refresh and stores the result "
+                f"({agg_re.search(expr).group(0).upper()} found). Move to the SQL source "
+                "or make it a measure if it should react to filters.")
+        elif label_re.search(expr):
+            add("MEDIUM", "calc_col_label",
+                f"Static label calculated column: {tbl}[{name}]",
+                "Row-level SWITCH/IF label that never reacts to filters - compute it "
+                "in the SQL source so it arrives precomputed and compresses normally.")
+
+    # 4. measures: blank-wrapper pattern --------------------------------------
+    for me in model.get("dax_measures", []):
+        expr = _expr_text(me, "expression", "expr")
+        name = _get(me, "name", "measurename", default="?")
+        if re.search(r"IF\s*\(\s*ISBLANK", expr, re.I):
+            add("LOW", "measure_blank",
+                f"Measure uses IF(ISBLANK(...)): {name}",
+                "Evaluates the aggregation twice. Equivalent: <agg>(...) + 0.")
+
+    # 5. Power Query: merges, FR, timeout, dev, incremental -------------------
+    pq_all = []
+    for p in model.get("power_query", []):
+        pq_all.append((_get(p, "tablename", "table", default="?"),
+                       _expr_text(p, "expression", "expr")))
+    merge_tbls = [t for t, e in pq_all if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e)]
+    fr_tbls = [t for t, e in pq_all if re.search(r"_translated|'fr'|-\s*FR", e, re.I)]
+    timeout_tbls = [(t, e) for t, e in pq_all if "CommandTimeout" in e]
+    has_range = any("RangeStart" in e for _, e in pq_all)
+    dev_hits = [t for t, e in pq_all if "dev" in e.lower()]
+    for p in model.get("m_parameters", []):
+        if "dev" in _expr_text(p, "expression", "value", "expr").lower():
+            dev_hits.append(_get(p, "parametername", "name", default="param"))
+
+    if merge_tbls:
+        add("MEDIUM", "m_merge",
+            "Client-side merges in Power Query",
+            f"NestedJoin/ExpandTableColumn in: {', '.join(sorted(set(merge_tbls))[:6])}. "
+            "These don't fold; push the joins into a source SQL view.")
+    if fr_tbls:
+        add("MEDIUM", "bilingual_fr",
+            "Bilingual (FR) / translated columns",
+            f"Translated('fr') or '- FR' columns in: {', '.join(sorted(set(fr_tbls))[:6])}. "
+            "Consider a language dimension instead of duplicate columns.")
+    if timeout_tbls:
+        add("MEDIUM", "command_timeout",
+            "Long CommandTimeout overrides",
+            f"CommandTimeout set on {len(timeout_tbls)} query(ies). Masks a slow source "
+            "query rather than fixing it.")
+    if not has_range and pq_all:
+        add("HIGH", "no_incremental",
+            "No incremental refresh",
+            "No RangeStart/RangeEnd parameters found - every refresh reloads all rows. "
+            "Enable incremental refresh on large historical tables.")
+    if dev_hits:
+        add("MEDIUM", "dev_server",
+            "Dev source referenced",
+            f"'dev' appears in: {', '.join(sorted(set(map(str, dev_hits)))[:6])}. "
+            "Re-point to QA/Prod; dev baselines aren't representative.")
+
+    # 6. column size / cardinality (if pbixray stats present) -----------------
+    for s in model.get("statistics", []):
+        card = _get(s, "cardinality", "count", default=None)
+        col = _get(s, "columnname", "column", default=None)
+        tbl = _get(s, "tablename", "table", default="")
+        try:
+            card = int(card)
+        except (TypeError, ValueError):
+            card = None
+        if card and card > HIGH_CARD_WARN and col:
+            add("MEDIUM", "high_cardinality",
+                f"High-cardinality column: {tbl}[{col}]",
+                f"~{card:,} distinct values - compresses poorly and inflates the cache. "
+                "Drop if unused, reduce precision, or split.")
+
+    # 7. wide tables ----------------------------------------------------------
+    col_counts = {}
+    for c in model.get("schema", []):
+        t = _get(c, "tablename", "table", default="?")
+        col_counts[t] = col_counts.get(t, 0) + 1
+    for t, n in col_counts.items():
+        if n >= 40 and not AUTO_TABLE_RE.match(t):
+            add("MEDIUM", "wide_table",
+                f"Very wide table: {t} ({n} columns)",
+                "Wide tables (esp. free-text/duplicate columns) dominate cache size. "
+                "Remove unused columns; run VertiPaq Analyzer to find the largest.")
+
+    # 8. report: slicers / visuals per page -----------------------------------
+    used_tables = set()
+    for pg in report.get("pages", []):
+        vis = pg.get("visuals", [])
+        slicers = [v for v in vis if v.get("type") == "slicer"]
+        for v in vis:
+            used_tables.update(v.get("tables", []))
+        if len(slicers) >= SLICER_WARN:
+            add("HIGH", "slicer_overload",
+                f"Many slicers on page '{pg.get('name')}'",
+                f"{len(slicers)} slicers - each queries on load and re-queries on every "
+                "interaction. Reduce, use the filter pane, or limit cross-interactions.")
+        if len(vis) >= VISUALS_WARN:
+            add("MEDIUM", "visual_overload",
+                f"Many visuals on page '{pg.get('name')}'",
+                f"{len(vis)} visuals on one page - each issues its own query at render.")
+
+    # 9. loaded-but-unused tables (needs both model + report) -----------------
+    if user_tables and report.get("pages"):
+        unused = [t for t in user_tables if t not in used_tables]
+        if unused:
+            add("HIGH", "unused_loaded_tables",
+                "Tables loaded but used by zero visuals",
+                f"{len(unused)} table(s) not referenced by any visual: "
+                f"{', '.join(unused[:8])}{'...' if len(unused) > 8 else ''}. "
+                "If they only feed Power Query merges, set Enable load = off "
+                "(connection-only) to drop the duplicate storage.")
+
+    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    findings.sort(key=lambda f: order.get(f["severity"], 9))
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+#  Rendering                                                                  #
+# --------------------------------------------------------------------------- #
+def render_findings_md(name, model, report, findings):
+    L = [f"# Performance findings - {name}\n"]
+    if model.get("error"):
+        L.append(f"> **Model extraction note:** {model['error']}\n")
+    L.append(f"- Tables: {len([t for t in model.get('tables', []) if not AUTO_TABLE_RE.match(t)])} "
+             f"user (+{len([t for t in model.get('tables', []) if AUTO_TABLE_RE.match(t)])} auto)")
+    L.append(f"- Measures: {len(model.get('dax_measures', []))}  ·  "
+             f"Calculated columns: {len(model.get('dax_columns', []))}  ·  "
+             f"Relationships: {len(model.get('relationships', []))}")
+    pages = report.get("pages", [])
+    total_vis = sum(len(p.get("visuals", [])) for p in pages)
+    total_slc = sum(len([v for v in p.get('visuals', []) if v.get('type') == 'slicer']) for p in pages)
+    L.append(f"- Report: {len(pages)} page(s), {total_vis} visual(s), {total_slc} slicer(s)")
+    if report.get("error"):
+        L.append(f"- Report note: {report['error']}")
+    L.append("")
+    if not findings:
+        L.append("_No rule-based issues detected._")
+    else:
+        L.append(f"## {len(findings)} finding(s)\n")
+        for f in findings:
+            L.append(f"### [{f['severity']}] {f['title']}")
+            L.append(f"{f['detail']}\n")
+    return "\n".join(L)
+
+
+# --------------------------------------------------------------------------- #
+def process_one(pbix_path, out_dir, report_only=None):
+    name = Path(pbix_path).stem
+    model = extract_model(pbix_path)
+    report = extract_visuals(report_only) if report_only else extract_visuals(pbix_path)
+    findings = detect(model, report)
+
+    facts = {"name": name, "model": model, "report": report}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{name}.facts.json").write_text(
+        json.dumps(facts, indent=2, default=str), encoding="utf-8")
+    (out_dir / f"{name}.findings.md").write_text(
+        render_findings_md(name, model, report, findings), encoding="utf-8")
+
+    sev_counts = {}
+    for f in findings:
+        sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
+    print(f"  {name}: {len(findings)} findings "
+          f"({', '.join(f'{k}={v}' for k, v in sev_counts.items()) or 'none'})")
+    return findings
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Extract perf facts + findings from .pbix file(s).")
+    ap.add_argument("path", help="A .pbix file, OR a folder containing .pbix files.")
+    ap.add_argument("-o", "--out", default="perf_out", help="Output folder (default: perf_out)")
+    ap.add_argument("--report-only", help="Read visuals from this extracted Report/PBIP folder "
+                                           "instead of the .pbix (model still from the .pbix).")
+    args = ap.parse_args()
+
+    p = Path(args.path)
+    out = Path(args.out)
+    if p.is_dir() and not args.report_only:
+        pbix = sorted(p.glob("*.pbix"))
+        if not pbix:
+            print("No .pbix files found in folder.")
+            sys.exit(1)
+        print(f"Scanning {len(pbix)} file(s)...")
+        for f in pbix:
+            process_one(f, out)
+    else:
+        print("Scanning 1 file...")
+        process_one(p, out, report_only=args.report_only)
+    print(f"Done. Facts + findings written to: {out}/")
+
+
+if __name__ == "__main__":
+    main()
