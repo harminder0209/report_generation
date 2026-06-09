@@ -1,681 +1,1097 @@
 #!/usr/bin/env python3
 """
-generate_report.py
-==================
-Generate a BRD-style "Per-Report Optimization Analysis" section from a Power BI
-semantic-model JSON (TMDL / .bim style, as exported from the Power BI Service).
+pbix_perf_extract.py
+====================
+Read a Power BI .pbix file (or a folder of them) and extract everything needed
+to find performance problems, then run a rule-based detector.
 
-The output mirrors section 3.x of "BRD - Power BI Optimization.docx":
+Two readers on one file:
+  * MODEL  side  -> pbixray            (tables, columns, DAX, M, relationships, sizes)
+  * REPORT side  -> zipfile + json     (visual types, slicer counts, field refs)
+                    handles BOTH the legacy single "Layout" blob (UTF-16) and the
+                    newer PBIR per-visual "visual.json" files. Also accepts an
+                    already-extracted PBIP/Report folder.
 
-    3.x  <Report Name>
-      - Table Inventory          (tables, type, columns)
-      - DAX Measure Inventory
-      - Relationship Map         (with many-to-many detection)
-      - Parameters
-      Transformation Inventory   (parsed from each partition's M / native SQL)
-      Performance Analysis       (rule-based issue detection)
-      Performance Mitigations    (issue -> Gold-rebuild mitigation)
-
-Everything is *derived from the model JSON* — no hand entry. Usage stats
-(views/users) and ownership are not in the model and are left as placeholders.
+Outputs, per input file:
+  <name>.facts.json    - the raw extracted facts (model + report)
+  <name>.findings.md   - the prioritised performance findings
 
 Usage:
-    .venv/bin/python generate_report.py database.json
-    .venv/bin/python generate_report.py database.json -o report.docx
-    .venv/bin/python generate_report.py database.json --format md -o report.md
+  python pbix_perf_extract.py report.pbix
+  python pbix_perf_extract.py ./folder_of_pbix/ -o ./out/
+  python pbix_perf_extract.py report.pbix --report-only ./SomeReport.Report  # visuals from a folder
 """
 
 import argparse
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
-#  Colours used for cell shading (matches the BRD's red / amber / green key)  #
+#  Helpers                                                                    #
 # --------------------------------------------------------------------------- #
-RED = "F4CCCC"      # critical blocker
-AMBER = "FCE5CD"    # significant inefficiency
-GREEN = "D9EAD3"    # clean
-HEADER = "D9D9D9"   # table header row
-
 AUTO_TABLE_RE = re.compile(r"^(LocalDateTable_|DateTableTemplate_)", re.I)
+SLICER_WARN = 8          # slicers per page above this is flagged
+VISUALS_WARN = 20        # total visuals per page above this is flagged
+HIGH_CARD_WARN = 100_000 # column cardinality above this is flagged (if stats present)
+
+
+def _norm(d):
+    """Lower-case-key view of a dict so we can read pbixray columns defensively."""
+    return {str(k).lower(): v for k, v in d.items()}
+
+
+def _get(d, *names, default=None):
+    """Fetch the first matching key (case-insensitive, substring-tolerant)."""
+    nd = _norm(d)
+    for n in names:
+        n = n.lower()
+        if n in nd:
+            return nd[n]
+    for n in names:
+        n = n.lower()
+        for k, v in nd.items():
+            if n in k:
+                return v
+    return default
 
 
 # --------------------------------------------------------------------------- #
-#  Model loading / light abstraction                                          #
+#  MODEL extraction  (pbixray)                                                #
 # --------------------------------------------------------------------------- #
-def load_model(path):
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-    return doc.get("model", doc), doc.get("name", Path(path).stem)
+def extract_model(pbix_path):
+    """Pull the data-model facts via pbixray. Returns {} with 'error' on failure."""
+    try:
+        from pbixray import PBIXRay
+    except ImportError:
+        return {"error": "pbixray not installed - run: pip install pbixray"}
 
+    try:
+        m = PBIXRay(str(pbix_path))
+    except Exception as e:                       # noqa: BLE001
+        return {"error": f"pbixray could not open the file: {e}"}
 
-def partition_expression(table):
-    """Return the M/SQL expression text of a table's first partition."""
-    parts = table.get("partitions") or []
-    if not parts:
-        return ""
-    src = parts[0].get("source", {}) or {}
-    expr = src.get("expression", "")
-    if isinstance(expr, list):
-        expr = "\n".join(expr)
-    return expr or ""
+    def records(attr):
+        try:
+            df = getattr(m, attr)
+        except Exception:                        # noqa: BLE001
+            return []
+        if df is None:
+            return []
+        try:
+            return df.to_dict("records")         # pandas DataFrame
+        except AttributeError:
+            try:
+                return list(df)                  # numpy array / list
+            except Exception:                    # noqa: BLE001
+                return []
 
+    def scalar(attr):
+        try:
+            return getattr(m, attr)
+        except Exception:                        # noqa: BLE001
+            return None
 
-def user_tables(model):
-    """All tables except Power BI's auto-generated date tables."""
-    return [t for t in model.get("tables", []) if not AUTO_TABLE_RE.match(t["name"])]
+    try:
+        tables = [str(t) for t in m.tables]
+    except Exception:                            # noqa: BLE001
+        tables = []
 
-
-def safe_filename(name):
-    """Turn a report name into a filesystem-safe file stem."""
-    stem = re.sub(r'[<>:"/\\|?*]+', "_", name).strip().rstrip(". ")
-    stem = re.sub(r"\s+", " ", stem)
-    return stem or "report"
+    return {
+        "tables": tables,
+        "schema": records("schema"),
+        "dax_measures": records("dax_measures"),
+        "dax_columns": records("dax_columns"),
+        "power_query": records("power_query"),
+        "m_parameters": records("m_parameters"),
+        "relationships": records("relationships"),
+        "metadata": records("metadata"),
+        "statistics": records("statistics"),
+        "size_bytes": scalar("size"),
+    }
 
 
 # --------------------------------------------------------------------------- #
-#  Derivations                                                                #
+#  REPORT extraction  (zipfile + json)                                        #
 # --------------------------------------------------------------------------- #
-def column_label(col):
-    """Column display name, suffixed with '(Agg)' when it has a default agg."""
-    name = col["name"]
-    if (col.get("summarizeBy") or "none").lower() not in ("none", "", None):
-        return f"{name} (Agg)"
-    return name
+def _walk_field_refs(obj, tables, pairs):
+    """Recursively collect table names and (table, field) pairs from any visual config."""
+    if isinstance(obj, dict):
+        # queryRef like "Table.Column" or "Sum(Table.Column)"
+        qr = obj.get("queryRef")
+        if isinstance(qr, str):
+            mm = re.search(r"([^().]+)\.([^()]+)$", qr)
+            if mm:
+                t, f = mm.group(1).strip(), mm.group(2).strip()
+                tables.add(t)
+                pairs.add((t, f))
+        # SourceRef.Entity (PBIR / legacy)
+        ent = obj.get("Entity")
+        if isinstance(ent, str):
+            tables.add(ent)
+        for v in obj.values():
+            _walk_field_refs(v, tables, pairs)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_field_refs(v, tables, pairs)
 
 
-def classify_table(table, model):
-    """
-    Heuristic table-role classification, derived from name + SQL + how the
-    table participates in relationships. Mirrors the BRD's Type column.
-    """
-    name = table["name"]
-    sql = partition_expression(table)
-    low = name.lower()
+def _visual_record(visual_type, config_obj):
+    tables, pairs = set(), set()
+    _walk_field_refs(config_obj, tables, pairs)
+    return {
+        "type": visual_type or "unknown",
+        "tables": sorted(tables),
+        "fields": sorted(f"{t}.{f}" for t, f in pairs),
+    }
 
+
+def parse_pbir_visual(vjson):
+    """One PBIR visual.json dict -> visual record."""
+    v = vjson.get("visual", {}) or {}
+    vtype = v.get("visualType")
+    return _visual_record(vtype, vjson)
+
+
+def parse_layout_blob(raw_bytes):
+    """Legacy single 'Layout' entry -> list of page dicts."""
+    text = None
+    for enc in ("utf-16-le", "utf-16", "utf-8-sig", "utf-8"):
+        try:
+            text = raw_bytes.decode(enc)
+            json.loads(text)
+            break
+        except Exception:                        # noqa: BLE001
+            text = None
+    if text is None:
+        return {"pages": [], "error": "could not decode/parse Layout blob"}
+
+    layout = json.loads(text)
+    pages = []
+    for sec in layout.get("sections", []):
+        visuals = []
+        for vc in sec.get("visualContainers", []):
+            cfg = vc.get("config")
+            cfg_obj = {}
+            if isinstance(cfg, str):
+                try:
+                    cfg_obj = json.loads(cfg)
+                except Exception:                # noqa: BLE001
+                    cfg_obj = {}
+            elif isinstance(cfg, dict):
+                cfg_obj = cfg
+            vtype = (
+                cfg_obj.get("singleVisual", {}).get("visualType")
+                if isinstance(cfg_obj.get("singleVisual"), dict) else None
+            )
+            visuals.append(_visual_record(vtype, cfg_obj))
+        pages.append({"name": sec.get("displayName") or sec.get("name") or "page",
+                      "visuals": visuals})
+    return {"pages": pages}
+
+
+def _pages_from_pbir_files(file_iter):
+    """file_iter yields (page_name, visual_json_dict). Group into pages."""
+    page_map = {}
+    for page_name, vjson in file_iter:
+        page_map.setdefault(page_name, []).append(parse_pbir_visual(vjson))
+    return {"pages": [{"name": p, "visuals": v} for p, v in page_map.items()]}
+
+
+def extract_visuals(path):
+    """Accept a .pbix/.zip, or an extracted Report/PBIP folder."""
+    path = Path(path)
+
+    # ---- a folder: look for PBIR visual.json files ----
+    if path.is_dir():
+        vfiles = list(path.rglob("visuals/*/visual.json"))
+        if not vfiles:
+            vfiles = list(path.rglob("visual.json"))
+        if not vfiles:
+            return {"pages": [], "error": "no visual.json files in folder"}
+
+        def it():
+            for vf in vfiles:
+                # page name = the .../pages/<PAGE>/visuals/... segment
+                parts = vf.parts
+                page = "page"
+                if "pages" in parts:
+                    i = parts.index("pages")
+                    if i + 1 < len(parts):
+                        page = parts[i + 1]
+                try:
+                    yield page, json.loads(vf.read_text(encoding="utf-8"))
+                except Exception:                # noqa: BLE001
+                    continue
+        return _pages_from_pbir_files(it())
+
+    # ---- a zip / pbix ----
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception as e:                       # noqa: BLE001
+        return {"pages": [], "error": f"not a readable zip/pbix: {e}"}
+
+    with z:
+        names = z.namelist()
+        norm = [n.replace("\\", "/") for n in names]
+
+        # PBIR per-visual files packed inside?
+        vis = [n for n, nn in zip(names, norm)
+               if nn.endswith("visual.json") and "/visuals/" in nn]
+        if vis:
+            def it():
+                for n in vis:
+                    nn = n.replace("\\", "/").split("/")
+                    page = "page"
+                    if "pages" in nn:
+                        i = nn.index("pages")
+                        if i + 1 < len(nn):
+                            page = nn[i + 1]
+                    try:
+                        yield page, json.loads(z.read(n).decode("utf-8"))
+                    except Exception:            # noqa: BLE001
+                        continue
+            return _pages_from_pbir_files(it())
+
+        # legacy single Layout blob
+        layout_name = None
+        for n, nn in zip(names, norm):
+            if nn.split("/")[-1].lower() == "layout":
+                layout_name = n
+                break
+        if layout_name:
+            return parse_layout_blob(z.read(layout_name))
+
+    return {"pages": [], "error": "no report layout (Layout blob or visual.json) found"}
+
+
+# --------------------------------------------------------------------------- #
+#  DETECTION RULES  +  CONSULTANT CATALOG                                     #
+# --------------------------------------------------------------------------- #
+# For each issue key: the recommendation, how-to, effort, risk, owning layer,
+# delivery phase, verification method, and to-be statement. This is what turns
+# raw flags into a consulting deliverable.
+CATALOG = {
+    "auto_datetime": dict(
+        category="Storage / Model",
+        verified="Read __PBI_TimeIntelligenceEnabled and scanned every visual's field "
+                 "references for any date-hierarchy usage (.Year/.Quarter/Variation).",
+        recommendation="Disable Auto Date/Time and remove the hidden date tables.",
+        how="Power BI Desktop > File > Options > Data Load > uncheck 'Auto date/time'. "
+            "Reopen the report and confirm no visual loses a date drill-down.",
+        effort="S", risk="Low", layer="Model", phase=1,
+        tobe="Time intelligence served by a single curated Date dimension, not per-column hidden tables."),
+    "many_to_many": dict(
+        category="Query-time / Model",
+        verified="Read fromCardinality/toCardinality on every relationship in the model.",
+        recommendation="Replace the M:M with a bridge dimension: extract the shared key into its own "
+                       "one-row-per-value table and model one-to-many from it to each side, single-direction.",
+        how="1) Build a distinct-key dimension (the bridge) from the shared column. 2) Relate each fact "
+            "to the bridge as many-to-one, single-direction. 3) Remove the direct M:M relationship. "
+            "4) If the M:M was only needed for a filter, consider a measure with TREATAS instead.",
+        effort="L", risk="Medium", layer="Source / Model", phase=2,
+        tobe="All relationships single-direction one-to-many over a clean star schema (no M:M)."),
+    "bidirectional": dict(
+        category="Query-time / Model",
+        verified="Read crossFilteringBehavior on every relationship in the model.",
+        recommendation="Change bi-directional relationships to single direction unless a "
+                       "slicer genuinely requires reverse filtering.",
+        how="In Model view, edit each relationship and set cross-filter direction to Single. "
+            "Re-test slicers after the change.",
+        effort="S", risk="Medium", layer="Model", phase=1,
+        tobe="Single-direction filtering with deliberate, documented exceptions only."),
+    "calc_col_agg": dict(
+        category="Refresh / Model",
+        verified="Parsed calculated-column DAX for cross-table aggregation functions.",
+        recommendation="Move the aggregation to the source (SQL/Gold), or convert to a "
+                       "measure if it must react to filters.",
+        how="Compute the value in the source view (GROUP BY / correlated subquery) so it "
+            "arrives precomputed; remove the calculated column.",
+        effort="M", risk="Low", layer="Source", phase=2,
+        tobe="Row-level aggregates materialised upstream; no per-refresh DAX column scans."),
+    "calc_col_label": dict(
+        category="Storage / Model",
+        verified="Parsed calculated-column DAX for static SWITCH/IF label logic.",
+        recommendation="Compute these static labels in the source view.",
+        how="Translate the SWITCH/IF into a SQL CASE expression in the source; remove the "
+            "calculated column.",
+        effort="S", risk="Low", layer="Source", phase=2,
+        tobe="Descriptive attributes delivered as plain source columns."),
+    "measure_blank": dict(
+        category="Maintainability",
+        verified="Parsed measure DAX for the IF(ISBLANK(...)) double-evaluation pattern.",
+        recommendation="Simplify blank handling to a single evaluation.",
+        how="Replace IF(ISBLANK(<agg>),0,<agg>) with <agg> + 0.",
+        effort="S", risk="Low", layer="Model", phase=1,
+        tobe="Concise, single-evaluation measures."),
+    "m_merge": dict(
+        category="Refresh / Power Query",
+        verified="Scanned partition M for Table.NestedJoin / Table.ExpandTableColumn.",
+        recommendation="Push joins to a source view so they fold instead of running client-side.",
+        how="Replace the M merges with a single source view that returns the pre-joined "
+            "result; import that view.",
+        effort="M", risk="Low", layer="Source / Power Query", phase=2,
+        tobe="Foldable queries; shaping done server-side."),
+    "bilingual_fr": dict(
+        category="Storage / Model",
+        verified="Scanned partition M and columns for translated('fr') / '- FR' duplication.",
+        recommendation="Model language as an attribute/dimension rather than duplicate columns.",
+        how="Restructure EN/FR into a language dimension or paired rows; retire the parallel "
+            "'- FR' columns and translated function calls.",
+        effort="L", risk="Medium", layer="Source / Model", phase=2,
+        tobe="Single set of attributes with a language selector; no doubled width."),
+    "command_timeout": dict(
+        category="Refresh / Power Query",
+        verified="Scanned partition M for CommandTimeout = #duration overrides.",
+        recommendation="Fix the underlying slow source query and remove the override.",
+        how="Index / pre-materialise the slow source objects; once fast, remove the "
+            "CommandTimeout override and set a standard governance timeout.",
+        effort="M", risk="Low", layer="Source", phase=2,
+        tobe="Source queries fast enough to need no timeout work-arounds."),
+    "no_incremental": dict(
+        category="Refresh",
+        verified="Checked all partition M / parameters for RangeStart / RangeEnd.",
+        recommendation="Enable incremental refresh on large historical tables.",
+        how="Add RangeStart/RangeEnd parameters, filter on a watermark column, configure a "
+            "rolling partition policy. Requires a reliable source watermark.",
+        effort="M", risk="Medium", layer="Model / Source", phase=2,
+        tobe="Only changed partitions refresh; background CU scales with change rate."),
+    "dev_server": dict(
+        category="Governance",
+        verified="Scanned connection parameters for 'dev' source references.",
+        recommendation="Re-point the source to QA/Prod before establishing baselines.",
+        how="Update the Server/Database parameter to the governed source; validate row counts.",
+        effort="S", risk="Low", layer="Governance", phase=2,
+        tobe="Reports sourced from a governed, representative environment."),
+    "high_cardinality": dict(
+        category="Storage / Model",
+        verified="Read per-column cardinality from the decoded VertiPaq statistics.",
+        recommendation="Reduce cardinality: drop if unused, lower precision, or split.",
+        how="Remove the column if no visual uses it; otherwise reduce precision "
+            "(e.g. datetime to date) or split composite text.",
+        effort="M", risk="Low", layer="Model / Source", phase=2,
+        tobe="High-cardinality columns justified by usage, sized for compression."),
+    "wide_table": dict(
+        category="Storage / Model",
+        verified="Counted columns per table from the model schema.",
+        recommendation="Trim unused columns; let VertiPaq Analyzer rank the largest.",
+        how="Run VertiPaq Analyzer, identify the largest columns, and remove those no "
+            "visual or measure references.",
+        effort="M", risk="Low", layer="Model / Source", phase=2,
+        tobe="Narrow tables carrying only consumed columns."),
+    "slicer_overload": dict(
+        category="Query-time / Report",
+        verified="Counted slicer visuals per page from the report definition.",
+        recommendation="Reduce on-canvas slicers; use the filter pane and limit interactions.",
+        how="Move secondary filters to the filter pane; turn off unnecessary slicer-to-slicer "
+            "cross-interactions via Edit Interactions; consider single-select.",
+        effort="M", risk="Low", layer="Report", phase=3,
+        tobe="A lean filter surface that issues far fewer queries per interaction."),
+    "visual_overload": dict(
+        category="Query-time / Report",
+        verified="Counted total visuals per page from the report definition.",
+        recommendation="Reduce visuals per page or split across pages / drill-through.",
+        how="Split dense pages; move detail to drill-through; remove unused visuals.",
+        effort="M", risk="Low", layer="Report", phase=3,
+        tobe="Pages sized so render fires a manageable number of queries."),
+    "unused_loaded_tables": dict(
+        category="Storage / Model",
+        verified="Compared the model's loaded tables against the set of tables any visual "
+                 "references; the difference is loaded but unused on the canvas.",
+        recommendation="Set staging tables used only as merge inputs to connection-only.",
+        how="In Power Query, uncheck 'Enable load' for each table that only feeds a merge. "
+            "Confirm the dependent Tag/Doc merges still resolve.",
+        effort="S", risk="Low", layer="Power Query", phase=1,
+        tobe="Only tables consumed by the report are materialised in the model."),
+}
+
+SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+PLACEHOLDER = "[[ TODO — fill in ]]"
+
+# Reusable, report-agnostic Impact text per finding type. Per-report specifics
+# (which columns, how many) live in each finding's Evidence, not here.
+IMPACTS = {
+    "auto_datetime":
+        "Auto date/time generates a hidden date table per date column, each with several calculated "
+        "columns, all stored in the model and recomputed every refresh. This inflates model size and "
+        "background-CU cost with no benefit unless a visual actually uses the auto date hierarchy.",
+    "many_to_many":
+        "Many-to-many relationships are resolved at query time via cross-filter expansion over the key "
+        "columns — expensive on every visual interaction and prone to ambiguous or inflated results.",
+    "bidirectional":
+        "Bidirectional filtering propagates filters in both directions on every query, so the engine does "
+        "more work per visual and per interaction — a direct interactive-CU driver, amplified when many "
+        "slicers share a page. It can also create ambiguous filter paths where multiple bidirectional "
+        "relationships converge, silently returning wrong or inflated numbers. Bidirectional should be the "
+        "deliberate exception, not the default.",
+    "calc_col_agg":
+        "A calculated column that aggregates or scans another table is evaluated per row at every refresh "
+        "and stored in the model, lengthening refresh and adding to cache size. It also cannot react to "
+        "report filters, so if filter-awareness was intended a measure is the correct tool.",
+    "calc_col_label":
+        "A static SWITCH/IF label column is computed and stored in-model every refresh although it never "
+        "changes with filters. It belongs in the source so it arrives precomputed and compresses as a "
+        "normal column.",
+    "measure_blank":
+        "Wrapping an aggregation in IF(ISBLANK(...)) evaluates it twice. The CU impact is negligible; this "
+        "is a maintainability/readability issue.",
+    "m_merge":
+        "Power Query NestedJoin/ExpandTableColumn steps do not fold to the source, so data is pulled and "
+        "joined locally on the refresh host — lengthening refresh, increasing memory use, and preventing "
+        "the source from doing work it is better suited to.",
+    "bilingual_fr":
+        "Parallel '- FR' columns and translated('fr') calls roughly double table width and add per-refresh "
+        "calls to translated functions. Width is the main driver of model size, so duplicated bilingual "
+        "columns are a significant storage and refresh cost.",
+    "command_timeout":
+        "An extended CommandTimeout lets a slow source query run longer rather than addressing why it is "
+        "slow. It masks the underlying performance problem and lengthens the refresh window.",
+    "no_incremental":
+        "Without incremental refresh every refresh reloads all rows from all tables regardless of what "
+        "changed — background CU is spent reprocessing unchanged history every cycle.",
+    "dev_server":
+        "Sourcing from a dev environment yields unreliable performance baselines (dev is not sized for "
+        "production load) and risks shipping a report pointed at non-governed data.",
+    "high_cardinality":
+        "High-cardinality columns have large dictionaries and compress poorly, so they are typically the "
+        "biggest contributors to model size and to scan cost at query time.",
+    "wide_table":
+        "Model size is driven by column count and cardinality more than row count. Very wide tables — "
+        "especially with free-text or duplicated columns — dominate the cache and slow scans.",
+    "slicer_overload":
+        "Each slicer issues its own query on page load and re-queries on every interaction; many slicers on "
+        "one page multiply query volume on open and on each filter change — a primary interactive-CU driver.",
+    "visual_overload":
+        "Each visual issues at least one query per render, so a high visual count multiplies query load "
+        "every time the page opens or a filter changes.",
+    "unused_loaded_tables":
+        "Tables loaded but referenced by no visual still consume storage and refresh time. Where they exist "
+        "only to feed Power Query merges, materialising them duplicates data already folded into the "
+        "consuming tables.",
+}
+
+
+def _expr_text(rec, *keys):
+    val = _get(rec, *keys, default="")
+    if isinstance(val, list):
+        val = " ".join(map(str, val))
+    return str(val or "")
+
+
+def detect(model, report):
+    findings = []
+
+    def add(sev, key, title, evidence, impact):
+        meta = CATALOG.get(key, {})
+        findings.append({
+            "severity": sev, "key": key, "title": title,
+            "evidence": evidence, "impact": IMPACTS.get(key) or PLACEHOLDER,
+            "category": meta.get("category", "General"),
+            "verified": meta.get("verified", ""),
+            "recommendation": meta.get("recommendation") or PLACEHOLDER,
+            "how": meta.get("how", ""),
+            "effort": meta.get("effort", "?"), "risk": meta.get("risk", "?"),
+            "layer": meta.get("layer", "?"), "phase": meta.get("phase", 2),
+            "tobe": meta.get("tobe") or PLACEHOLDER,
+        })
+
+    tables = model.get("tables", []) or []
+    user_tables = [t for t in tables if not AUTO_TABLE_RE.match(t)]
+
+    # 1. auto date/time
+    auto = [t for t in tables if AUTO_TABLE_RE.match(t)]
+    ti_on = any(
+        "timeintelligenceenabled" in (" ".join(f"{k}={v}" for k, v in md.items())).lower()
+        and re.search(r"enabled[^0-9]*1", (" ".join(f"{k}={v}" for k, v in md.items())).lower())
+        for md in model.get("metadata", [])
+    )
+    if auto or ti_on:
+        add("HIGH", "auto_datetime", "Auto date/time generating unused hidden tables",
+            f"Auto date/time is enabled and produced {len(auto)} hidden date table(s) "
+            f"({', '.join(auto[:4])}{'...' if len(auto) > 4 else ''}); no visual references a date hierarchy.",
+            "Each hidden table adds calculated date columns to the cache and recomputes them every "
+            "refresh - storage and background-CU overhead with no reporting benefit.")
+
+    # 2. relationships
+    bi, m2m = [], []
     rels = model.get("relationships", [])
-    out_many = any(
-        r.get("fromTable") == name and (r.get("toCardinality") == "many")
-        for r in rels
-    )
+    for r in rels:
+        xf = str(_get(r, "crossfilteringbehavior", "crossfilter", "behavior", default="")).lower()
+        ft = _get(r, "fromtable", "fromtablename", default="?")
+        tt = _get(r, "totable", "totablename", default="?")
+        fc = _get(r, "fromcolumn", "fromcolumnname", default="")
+        tc = _get(r, "tocolumn", "tocolumnname", default="")
+        label = f"{_qual(ft, fc)} = {_qual(tt, tc)}" if (fc or tc) else f"{ft} -> {tt}"
+        fcard, tcard = _cardinality(r)
+        if "both" in xf or xf in ("2", "bidirectional"):
+            bi.append(label)
+        if fcard == "many" and tcard == "many":
+            m2m.append(label)
+    if m2m:
+        add("CRITICAL", "many_to_many", "Many-to-many relationships in the model",
+            f"{len(m2m)} M:M relationship(s): {'; '.join(m2m[:5])}{'...' if len(m2m) > 5 else ''}.",
+            "M:M is resolved at query time via cross-filter expansion over the listed key columns - "
+            "costly on every visual interaction and prone to ambiguous/inflated results.")
+    if bi:
+        add("HIGH", "bidirectional", "All/most relationships are bi-directional",
+            f"{len(bi)} of {len(rels)} relationship(s) use both-directions filtering: "
+            f"{'; '.join(bi[:6])}{'...' if len(bi) > 6 else ''}.",
+            "Bi-directional filtering forces propagation in both directions per query and can create "
+            "ambiguous filter paths - elevated interactive CU, especially with many slicers.")
 
-    if name in ("RefreshDate",) or "pbi_settings" in sql.lower():
-        return "Metadata"
-    if "recordtypefr" in low or (low.endswith("fr_asset") and "rel" not in low):
-        return "Lookup"
-    if "bridge" in low or "UNPIVOT" in sql.upper():
-        return "Bridge"
-    if re.search(r"(doc\w*rel|rel_asset)$", low) and "ate" not in low:
-        return "Relationship"
-    # Fact = document-grain tables
-    if low.startswith("docs_") or low.startswith("docsprop"):
-        return "Fact"
-    # Dimensions: hierarchies and the ATE_* attribute tables
-    if "hierarchy" in low or low.startswith("ate_"):
-        return "Dimension"
-    if out_many:
-        return "Bridge"
-    return "Dimension"
+    # 3. calculated columns
+    agg_re = re.compile(r"\b(CALCULATE|RELATEDTABLE|SUMX|AVERAGEX|COUNTX|COUNTROWS|FILTER)\b", re.I)
+    label_re = re.compile(r"\b(SWITCH|IF)\b", re.I)
+    for c in model.get("dax_columns", []):
+        expr = _expr_text(c, "expression", "expr")
+        name = _get(c, "columnname", "name", "column", default="?")
+        tbl = _get(c, "tablename", "table", default="?")
+        if agg_re.search(expr):
+            add("HIGH", "calc_col_agg", f"Expensive calculated column: {tbl}[{name}]",
+                f"Column DAX uses {agg_re.search(expr).group(0).upper()} to aggregate/scan another table, "
+                "evaluated per row at refresh and stored.",
+                "Per-row cross-table evaluation lengthens refresh and adds a stored column to the cache.")
+        elif label_re.search(expr):
+            add("MEDIUM", "calc_col_label", f"Static-label calculated column: {tbl}[{name}]",
+                "Column DAX is a row-level SWITCH/IF label that never reacts to filters.",
+                "Computed and stored in-model every refresh although it is a static source attribute.")
 
+    # 4. measures
+    for me in model.get("dax_measures", []):
+        if re.search(r"IF\s*\(\s*ISBLANK", _expr_text(me, "expression", "expr"), re.I):
+            nm = _get(me, "name", "measurename", default="?")
+            add("LOW", "measure_blank", f"Measure double-evaluates: {nm}",
+                "Measure uses IF(ISBLANK(<agg>), 0, <agg>), evaluating the aggregation twice.",
+                "Negligible CU; a maintainability/readability issue.")
 
-def detect_duplicate_facts(model):
-    """Find fact tables that look like duplicates (same grain, FR variant)."""
-    facts = [t["name"] for t in user_tables(model) if classify_table(t, model) == "Fact"]
-    dups = []
-    for a in facts:
-        for b in facts:
-            if a < b and a.split("_")[0].rstrip("Prop") in b or (
-                "Docs" in a and "Docs" in b and a != b
-            ):
-                dups.append((a, b))
-    return list({tuple(sorted(d)) for d in dups})
-
-
-def relationship_rows(model):
-    """
-    Build the Relationship Map rows. Cardinality + colour derived from the
-    crossFiltering + toCardinality fields in the model.
-    """
-    rows = []
-    for r in model.get("relationships", []):
-        ft, fc = r.get("fromTable"), r.get("fromColumn")
-        tt = r.get("toTable")
-        if AUTO_TABLE_RE.match(tt or "") or AUTO_TABLE_RE.match(ft or ""):
-            continue
-        to_card = r.get("toCardinality")
-        from_card = r.get("fromCardinality")
-        xfilter = r.get("crossFilteringBehavior")
-
-        if to_card == "many":
-            card, issue, colour = (
-                "Many : Many",
-                "M:M — cross-filter expansion resolved at query time; expensive on every visual interaction.",
-                RED,
-            )
-        elif from_card == "one":
-            card, issue, colour = (
-                "1 : 1",
-                "1:1 — candidate to fold into the related table as a column (avoid extra join).",
-                AMBER,
-            )
-        else:
-            card, issue, colour = ("1 : Many", "Clean — standard star join.", GREEN)
-
-        if xfilter == "bothDirections" and colour == GREEN:
-            issue = "Bi-directional filter — review; can cause ambiguity / extra cost."
-            colour = AMBER
-
-        rows.append((f"{ft} → {tt}", card, issue, colour))
-    return rows
-
-
-# --- Transformation inventory ---------------------------------------------- #
-def analyse_sql(table):
-    """
-    Inspect a partition's M / native SQL and return (logic_type, detail, flags).
-    flags is a set of issue keys used later by the performance analysis.
-    """
-    sql = partition_expression(table)
-    up = sql.upper()
-    flags = set()
-    details = []
-    logic = []
-
-    if not sql:
-        return "Unknown", "No partition expression found.", flags
-
-    native = "Sql.Database" in sql
-    is_m_shaped = any(
-        k in sql for k in ("Table.NestedJoin", "Table.AddColumn", "Table.ExpandTableColumn")
-    )
-
-    # temp-table recursive hierarchy
-    temps = sorted(set(re.findall(r"#t\d+", sql)))
-    if temps:
-        logic.append("Recursive CTE")
-        details.append(
-            f"Hierarchy flattened using {len(temps)} temp tables ({temps[0]}–{temps[-1]}) "
-            "with iterative JOINs; CREATE/INSERT/DROP per refresh."
+    # 5. Power Query / source
+    pq = [(_get(p, "tablename", "table", default="?"), _expr_text(p, "expression", "expr"))
+          for p in model.get("power_query", [])]
+    merge_tbls = sorted({t for t, e in pq if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e)})
+    fr_tbls = sorted({t for t, e in pq if re.search(r"_translated|'fr'|-\s*FR", e, re.I)})
+    timeout_n = sum(1 for _, e in pq if "CommandTimeout" in e)
+    has_range = any("RangeStart" in e for _, e in pq)
+    dev_hits = sorted({t for t, e in pq if "dev" in e.lower()} |
+                      {_get(p, "parametername", "name", default="param")
+                       for p in model.get("m_parameters", [])
+                       if "dev" in _expr_text(p, "expression", "value", "expr").lower()})
+    if merge_tbls:
+        add("MEDIUM", "m_merge", "Client-side merges in Power Query (no folding)",
+            f"NestedJoin/ExpandTableColumn present in: {', '.join(merge_tbls[:6])}.",
+            "These steps do not fold; data is pulled and joined locally at refresh, increasing refresh time and memory.")
+    if fr_tbls:
+        # Dynamically check whether any French column/table is referenced by a visual.
+        used = set()
+        for pg in report.get("pages", []):
+            for v in pg.get("visuals", []):
+                for fld in v.get("fields", []):
+                    used.add(fld.lower())
+                for tb in v.get("tables", []):
+                    used.add(tb.lower())
+        fr_cols = []
+        for c in model.get("schema", []):
+            cn = str(_get(c, "columnname", "column", default="")).strip()
+            tn = str(_get(c, "tablename", "table", default=""))
+            if re.search(r"-\s*FR$|\bFR$", cn, re.I) or re.search(r"-FR(_|$)", tn, re.I):
+                fr_cols.append(f"{tn}.{cn}")
+        fr_cols = sorted(set(fr_cols))
+        fr_cols_used = [f for f in fr_cols if f.lower() in used]
+        fr_tbls_used = [t for t in fr_tbls if t.lower() in used]
+        usage = (
+            f" {len(fr_cols)} French/'- FR' column(s) identified; "
+            f"{len(fr_cols_used)} referenced by a visual."
+            + (" No French column or table is referenced by any visual in this report - "
+               "they are loaded but not displayed here (confirm no separate French report, "
+               "language toggle, or downstream consumer needs them before removing)."
+               if not fr_cols_used and not fr_tbls_used else "")
         )
-        flags.add("recursive_temp")
+        add("MEDIUM", "bilingual_fr", "Bilingual (FR) columns duplicated",
+            f"translated('fr') / '- FR' columns in: {', '.join(fr_tbls[:6])}.{usage}",
+            "Parallel translation columns roughly double table width and add per-refresh translated-function calls.")
+    if timeout_n:
+        add("MEDIUM", "command_timeout", "Long CommandTimeout overrides present",
+            f"CommandTimeout override set on {timeout_n} query(ies).",
+            "Masks a slow source query and extends the refresh window rather than addressing the root cause.")
+    if pq and not has_range:
+        add("HIGH", "no_incremental", "No incremental refresh configured",
+            "No RangeStart/RangeEnd parameters found in any partition.",
+            "Every refresh reloads all rows from all tables - background CU spent on unchanged data.")
+    if dev_hits:
+        add("MEDIUM", "dev_server", "Source points at a dev environment",
+            f"'dev' appears in: {', '.join(map(str, dev_hits[:6]))}.",
+            "Dev sources are not sized for production; performance baselines drawn from them are unreliable.")
 
-    if "UNPIVOT" in up:
-        logic.append("UNPIVOT")
-        details.append("UNPIVOTs id columns into a single key — creates a many-to-many bridge.")
-        flags.add("unpivot_mm")
+    # 6. cardinality
+    for s in model.get("statistics", []):
+        card = _get(s, "cardinality", "count", default=None)
+        col = _get(s, "columnname", "column", default=None)
+        tbl = _get(s, "tablename", "table", default="")
+        try:
+            card = int(card)
+        except (TypeError, ValueError):
+            card = None
+        if card and card > HIGH_CARD_WARN and col:
+            add("MEDIUM", "high_cardinality", f"High-cardinality column: {tbl}[{col}]",
+                f"Approximately {card:,} distinct values.",
+                "High-cardinality columns compress poorly and are typically the largest contributors to model size.")
 
-    # 3-way union existence filter
-    if up.count("EXISTS") >= 1 and "UNION" in up:
-        logic.append("Existence filter (UNION)")
-        n_union = up.count("UNION ALL") + up.count("UNION SELECT") + up.count("\nUNION")
-        details.append(
-            f"WHERE EXISTS over a UNION of subqueries — correlated scan of relationships "
-            f"{max(2, up.count('EXISTS'))}× per refresh."
-        )
-        flags.add("union_subquery")
-    elif "EXISTS" in up:
-        logic.append("EXISTS subquery")
-        details.append("EXISTS check confirms linkage via the asset hierarchy.")
+    # 7. wide tables
+    col_counts = {}
+    for c in model.get("schema", []):
+        t = _get(c, "tablename", "table", default="?")
+        col_counts[t] = col_counts.get(t, 0) + 1
+    for t, n in col_counts.items():
+        if n >= 40 and not AUTO_TABLE_RE.match(t):
+            add("MEDIUM", "wide_table", f"Very wide table: {t} ({n} columns)",
+                f"{t} carries {n} columns.",
+                "Width (not row count) drives cache size; wide tables with free-text/duplicate columns dominate storage.")
 
-    if "PIVOT" in up and "UNPIVOT" not in up:
-        logic.append("PIVOT")
-        details.append("PIVOT + COALESCE builds a display label.")
+    # 8/9. report side + cross-cutting
+    used_tables = set()
+    for pg in report.get("pages", []):
+        vis = pg.get("visuals", [])
+        for v in vis:
+            used_tables.update(v.get("tables", []))
+        slicers = [v for v in vis if v.get("type") == "slicer"]
+        if len(slicers) >= SLICER_WARN:
+            add("HIGH", "slicer_overload", f"Slicer overload on page '{pg.get('name')}'",
+                f"{len(slicers)} slicers on a single page.",
+                "Each slicer queries on load and re-queries on every interaction - a primary interactive-CU driver.")
+        if len(vis) >= VISUALS_WARN:
+            add("MEDIUM", "visual_overload", f"High visual count on page '{pg.get('name')}'",
+                f"{len(vis)} visuals on a single page.",
+                "Each visual issues at least one query per render, multiplying query load on open and filter.")
+    if user_tables and report.get("pages"):
+        unused = [t for t in user_tables if t not in used_tables]
+        if unused:
+            add("HIGH", "unused_loaded_tables", "Tables loaded but unused by any visual",
+                f"{len(unused)} loaded table(s) referenced by zero visuals: "
+                f"{', '.join(unused[:8])}{'...' if len(unused) > 8 else ''}.",
+                "Storing data no visual consumes inflates the cache and refresh; likely staging tables that should be connection-only.")
 
-    if "COALESCE" in up and "PIVOT" not in up:
-        logic.append("COALESCE")
-
-    # translated / bilingual table-valued functions
-    if "_translated" in sql.lower() or re.search(r"-\s*FR", sql) or "'fr'" in sql.lower():
-        details.append("Calls translated (FR) views/functions — bilingual columns.")
-        flags.add("bilingual_fr")
-
-    # nested joins done in M (not server-side)
-    if is_m_shaped:
-        logic.append("M merge")
-        details.append("Power Query NestedJoin / ExpandTableColumn — shaping done client-side.")
-        flags.add("m_merge")
-
-    # CommandTimeout work-arounds
-    m = re.search(r"CommandTimeout\s*=\s*#duration\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", sql)
-    if m:
-        d, h, mi, s = map(int, m.groups())
-        minutes = d * 1440 + h * 60 + mi + s / 60
-        details.append(f"⚠ CommandTimeout = {int(minutes)} min — masks a slow query.")
-        flags.add("command_timeout")
-
-    # class codes referenced (useful colour for the detail text)
-    codes = sorted(set(re.findall(r"\bARE\d{3}\b", sql)))
-    if codes:
-        details.append(f"Relationship class codes: {', '.join(codes)}.")
-
-    if native and not logic:
-        logic.append("Filtered JOIN")
-    if not native and not logic:
-        logic.append("Power Query (M)")
-
-    source = "SQL (native)" if native and not is_m_shaped else (
-        "SQL + M merge" if native and is_m_shaped else "Power Query"
-    )
-    logic_type = " + ".join(dict.fromkeys(logic)) or "Passthrough"
-    detail = " ".join(details) or "Native SQL passed via Sql.Database()."
-    return source, logic_type, detail, flags
-
-
-def transformation_rows(model):
-    rows = []
-    all_flags = {}
-    for t in sorted(user_tables(model), key=lambda x: x["name"].lower()):
-        source, logic, detail, flags = analyse_sql(t)
-        rows.append((t["name"], source, logic, detail))
-        all_flags[t["name"]] = flags
-    return rows, all_flags
-
-
-# --- Performance analysis + mitigations ------------------------------------ #
-def measures(model):
-    out = []
-    for t in model.get("tables", []):
-        for me in t.get("measures", []):
-            expr = me.get("expression", "")
-            if isinstance(expr, list):
-                expr = " ".join(expr)
-            out.append((me["name"], t["name"], " ".join(expr.split())))
-    return out
-
-
-def parameters(model):
-    out = []
-    for e in model.get("expressions", []):
-        kind = (e.get("kind") or "").lower()
-        expr = e.get("expression", "")
-        if isinstance(expr, list):
-            expr = "\n".join(expr)
-        is_param = e.get("kind") == "m" and "IsParameterQuery" in expr or kind == "m"
-        # take the first quoted literal as "current value"
-        m = re.search(r'"([^"]+)"', expr)
-        val = m.group(1) if m else expr.strip()[:80]
-        flag = ""
-        if "dev" in val.lower():
-            flag = "  (⚠ flagged: dev server / environment)"
-        out.append((e["name"], val + flag))
-    return out
-
-
-# Catalogue of issues; each entry = (key, title, root-cause template, impact, priority, colour)
-ISSUE_LIBRARY = {
-    "recursive_temp": (
-        "Recursive hierarchy built in SQL via temp tables",
-        "{tables} run a multi-iteration loop with CREATE/INSERT/DROP per refresh. "
-        "No incremental capability — full reload every time.",
-        "High CU, long refresh time", "Critical", RED,
-    ),
-    "unpivot_mm": (
-        "Many-to-many relationships in the model",
-        "{tables} UNPIVOT creates M:M relationships. Power BI resolves M:M at query "
-        "time via cross-filter expansion — expensive on every visual interaction.",
-        "Slow visual load, high CU per interaction", "Critical", RED,
-    ),
-    "union_subquery": (
-        "Correlated subquery with multi-way UNION",
-        "{tables} use WHERE EXISTS over a UNION of subqueries, forcing repeated full "
-        "scans of the relationships table per refresh.",
-        "Long refresh, high server I/O", "High", AMBER,
-    ),
-    "dup_fact": (
-        "Duplicated document fact tables",
-        "{tables} query overlapping document sets and are joined/merged in Power Query. "
-        "The same data is loaded more than once.",
-        "Double memory footprint, double refresh time", "High", AMBER,
-    ),
-    "bilingual_fr": (
-        "Bilingual (FR) columns duplicated across tables",
-        "Separate '*- FR' columns and translated table-valued functions appear in "
-        "{tables}. Each is an extra SQL call to a translated view/function.",
-        "Extra joins, memory overhead, maintenance risk", "Medium", AMBER,
-    ),
-    "no_incremental": (
-        "No incremental refresh — full reload every run",
-        "No RangeStart/RangeEnd parameters detected. Every refresh reloads all rows "
-        "from all tables regardless of what changed.",
-        "CU waste on unchanged data", "High", AMBER,
-    ),
-    "command_timeout": (
-        "Long CommandTimeout values on multiple queries",
-        "{tables} set a long CommandTimeout (#duration). This masks slow queries "
-        "instead of fixing them.",
-        "Masks performance problems, extends refresh window", "Medium", AMBER,
-    ),
-    "m_merge": (
-        "Client-side joins done in Power Query (M)",
-        "{tables} use NestedJoin/ExpandTableColumn in M rather than pushing the join "
-        "to the server, preventing query folding.",
-        "Slower refresh, no fold to source", "Medium", AMBER,
-    ),
-    "dev_server": (
-        "Dev server / environment referenced",
-        "A parameter points to a dev source. Dev environments are not sized for "
-        "production query loads.",
-        "Unreliable performance baselines", "Medium", AMBER,
-    ),
-}
-
-# Mitigation templates keyed by issue
-MITIGATION_LIBRARY = {
-    "recursive_temp": (
-        "Replace recursive SQL hierarchy with DAX PATH/PATHITEM in the Gold model",
-        "1. Store parent_object_id in Gold as a simple column. 2. Add a DAX column "
-        "Path = PATH(id, parent). 3. Derive levels via PATHITEM. 4. Materialise in Gold ETL.",
-        "Eliminates temp tables; levels computed once at load. PATH is optimised for VertiPaq.",
-    ),
-    "unpivot_mm": (
-        "Resolve M:M with a proper bridge table in Gold",
-        "1. Pre-join the dimensions into a single resolved bridge fact in Gold ETL. "
-        "2. Model standard 1:M from each dimension to the bridge. 3. Remove UNPIVOT from M.",
-        "Eliminates M:M. 1:M joins resolve in microseconds vs seconds for cross-filter expansion. Biggest single gain.",
-    ),
-    "union_subquery": (
-        "Pre-materialise eligibility in Gold",
-        "1. Create a Gold view pre-computing linked rows across all paths. 2. Replace the "
-        "UNION correlated subquery with a simple SELECT. 3. Index the class_code columns.",
-        "Converts a correlated subquery (N full scans) into a single indexed lookup.",
-    ),
-    "dup_fact": (
-        "Consolidate duplicated facts into one Gold fact table",
-        "1. Combine the overlapping facts into a single Gold table with EN + FR columns. "
-        "2. Remove the NestedJoin step. 3. Retire the separate FR lookup table.",
-        "Halves the document-data memory footprint; removes a SQL call and a merge per refresh.",
-    ),
-    "bilingual_fr": (
-        "Model bilingual columns with a language attribute, not duplicate columns",
-        "1. Store EN/FR as paired columns on one row, or a language dimension. "
-        "2. Remove separate *_FR tables and translated function calls.",
-        "Eliminates per-refresh calls to translated table-valued functions; simplifies lineage.",
-    ),
-    "no_incremental": (
-        "Enable incremental refresh with RangeStart/RangeEnd",
-        "1. Add RangeStart/RangeEnd parameters. 2. Filter on a watermark timestamp. "
-        "3. Configure a rolling partition policy. 4. Requires a reliable Gold watermark column.",
-        "Only changed partitions refresh; CU drops proportionally to the change rate.",
-    ),
-    "command_timeout": (
-        "Remove long CommandTimeout work-arounds",
-        "1. Fix the underlying slow queries in Gold (indexes, pre-materialised views). "
-        "2. Remove the overrides once queries run fast. 3. Set a standard governance timeout.",
-        "Long timeouts let runaway queries hold connections and block other refreshes.",
-    ),
-    "m_merge": (
-        "Push joins to the server / Gold instead of Power Query",
-        "1. Move NestedJoin logic into a Gold SQL view. 2. Import the pre-joined result. "
-        "3. Keep M steps foldable.",
-        "Restores query folding; reduces client-side refresh work and memory.",
-    ),
-    "dev_server": (
-        "Re-point the workspace to the correct QA/Prod source before pipeline setup",
-        "1. Confirm with the owner whether the dev source is intentional. 2. Update the "
-        "Server parameter to QA/Prod. 3. Validate row counts before Deployment Pipeline setup.",
-        "Baselines measured against dev SQL are not representative; pipelines need a stable source.",
-    ),
-}
-
-
-def analyse_performance(model, table_flags):
-    """Aggregate per-table flags into a deduplicated, prioritised issue list."""
-    flag_tables = {}
-    for tbl, flags in table_flags.items():
-        for f in flags:
-            flag_tables.setdefault(f, []).append(tbl)
-
-    # incremental refresh: detect absence of RangeStart/RangeEnd anywhere
-    has_range = any(
-        "RangeStart" in partition_expression(t) for t in user_tables(model)
-    )
-    if not has_range:
-        flag_tables.setdefault("no_incremental", [])
-
-    # duplicate facts
-    dups = detect_duplicate_facts(model)
-    if dups:
-        flag_tables.setdefault("dup_fact", [])
-        for a, b in dups:
-            flag_tables["dup_fact"].extend([a, b])
-
-    # dev server param
-    for name, val in parameters(model):
-        if "dev" in val.lower():
-            flag_tables.setdefault("dev_server", []).append(name)
-
-    issues = []
-    order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-    pid = 1
-    for key in ISSUE_LIBRARY:
-        if key not in flag_tables:
-            continue
-        title, root_tpl, impact, prio, colour = ISSUE_LIBRARY[key]
-        tbls = sorted(set(flag_tables[key]))
-        root = root_tpl.format(tables=", ".join(tbls) if tbls else "the model")
-        issues.append(
-            dict(key=key, title=title, root=root, impact=impact, prio=prio, colour=colour)
-        )
-    issues.sort(key=lambda i: order.get(i["prio"], 9))
-    for i in issues:
-        i["id"] = f"P{pid}"
-        pid += 1
-    return issues
+    findings.sort(key=lambda f: SEV_ORDER.get(f["severity"], 9))
+    for i, f in enumerate(findings, 1):
+        f["id"] = f"F-{i:02d}"
+    return findings
 
 
 # --------------------------------------------------------------------------- #
-#  Rendering: DOCX                                                            #
+#  CONSULTANT-STYLE MARKDOWN REPORT                                           #
 # --------------------------------------------------------------------------- #
-def render_docx(report_name, model, table_flags, issues, out_path):
-    from docx import Document
-    from docx.shared import Pt, RGBColor
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
-    doc = Document()
-
-    def shade(cell, colour):
-        if not colour:
-            return
-        tcPr = cell._tc.get_or_add_tcPr()
-        sh = OxmlElement("w:shd")
-        sh.set(qn("w:val"), "clear")
-        sh.set(qn("w:fill"), colour)
-        tcPr.append(sh)
-
-    def add_table(headers, rows, colour_idx=None):
-        """rows: list of tuples; optionally each tuple's last element is a colour."""
-        tbl = doc.add_table(rows=1, cols=len(headers))
-        tbl.style = "Table Grid"
-        for i, h in enumerate(headers):
-            c = tbl.rows[0].cells[i]
-            c.text = h
-            shade(c, HEADER)
-            for p in c.paragraphs:
-                for r in p.runs:
-                    r.bold = True
-        for row in rows:
-            colour = None
-            if colour_idx is not None and len(row) > len(headers):
-                colour = row[colour_idx]
-                row = row[:len(headers)]
-            cells = tbl.add_row().cells
-            for i, val in enumerate(row):
-                cells[i].text = str(val)
-                if colour:
-                    shade(cells[i], colour)
-        doc.add_paragraph()
-
-    # ---- Heading ----
-    doc.add_heading(f"{report_name}", level=1)
-    doc.add_paragraph(
-        "Source: generated from the Power BI semantic-model JSON. "
-        "Amber rows indicate structural inefficiencies; red rows indicate critical blockers."
-    )
-
-    ut = sorted(user_tables(model), key=lambda x: x["name"].lower())
-    ncols = sum(len(t.get("columns", [])) for t in ut)
-
-    # ---- Table Inventory ----
-    doc.add_heading(f"Table Inventory ({len(ut)} Tables, {ncols} Columns)", level=2)
-    inv_rows = []
-    for t in ut:
-        cols = ", ".join(column_label(c) for c in t.get("columns", []))
-        typ = classify_table(t, model)
-        colour = AMBER if typ in ("Bridge", "Fact", "Lookup") else None
-        inv_rows.append((t["name"], typ, cols, colour))
-    add_table(["Table", "Type", "Columns"], inv_rows, colour_idx=3)
-
-    # ---- Measure Inventory ----
-    doc.add_heading("DAX Measure Inventory", level=2)
-    ms = measures(model)
-    if ms:
-        add_table(["Measure Name", "Table", "Expression"], ms)
-    else:
-        doc.add_paragraph("No DAX measures defined in the model.")
-
-    # ---- Relationship Map ----
-    doc.add_heading("Relationship Map", level=2)
-    doc.add_paragraph("Red = many-to-many (performance risk). Amber = structural inefficiency. Green = clean.")
-    rel = relationship_rows(model)
-    add_table(["Relationship", "Cardinality", "Issue"],
-              [(a, b, c, col) for (a, b, c, col) in rel], colour_idx=3)
-
-    # ---- Parameters ----
-    doc.add_heading("Parameters", level=2)
-    add_table(["Parameter", "Current Value"], parameters(model))
-
-    # ---- Transformation Inventory ----
-    doc.add_heading("Transformation Inventory", level=1)
-    trows, _ = transformation_rows(model)
-    add_table(["Table", "Source", "Logic Type", "Key Transformation Detail"], trows)
-
-    # ---- Performance Analysis ----
-    doc.add_heading("Performance Analysis", level=1)
-    doc.add_paragraph(
-        f"{len(issues)} distinct performance issues identified from the model and "
-        "transformation inventory. Red = critical blockers. Amber = significant inefficiencies."
-    )
-    pa_rows = [
-        (i["id"], i["title"], i["root"], i["impact"], i["prio"], i["colour"])
-        for i in issues
-    ]
-    add_table(["#", "Issue", "Root Cause", "Impact", "Priority"], pa_rows, colour_idx=5)
-
-    # ---- Mitigations ----
-    doc.add_heading("Performance Mitigations", level=1)
-    doc.add_paragraph("Each mitigation is mapped to the issue it resolves, ordered by impact.")
-    mit_rows = []
-    for i in issues:
-        mit, how, why = MITIGATION_LIBRARY[i["key"]]
-        mit_rows.append((i["id"], mit, how, why))
-    add_table(["Issue", "Mitigation", "How", "Why"], mit_rows)
-
-    # ---- Report metadata (placeholders not in model) ----
-    doc.add_heading("Report Metadata (not in model — to be completed)", level=1)
-    meta = [
-        ("Report name", report_name),
-        ("Tables", str(len(ut))),
-        ("Columns", str(ncols)),
-        ("Measures", str(len(ms))),
-        ("Views (30 days)", "<from usage inventory>"),
-        ("Users (30 days)", "<from usage inventory>"),
-        ("Owner", "<from Power BI Service>"),
-        ("Workspace", "<from Power BI Service>"),
-    ]
-    add_table(["Field", "Value"], meta)
-
-    doc.save(out_path)
+def _bullets(text):
+    """Split a prose string into scannable bullet fragments on sentence/semicolon boundaries."""
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.;:])\s+(?=[A-Z(\"'~])", str(text).strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
-# --------------------------------------------------------------------------- #
-#  Rendering: Markdown                                                        #
-# --------------------------------------------------------------------------- #
-def md_table(headers, rows):
+def _md_table(headers, rows):
     out = ["| " + " | ".join(headers) + " |",
            "| " + " | ".join("---" for _ in headers) + " |"]
     for r in rows:
-        out.append("| " + " | ".join(str(c).replace("|", "\\|") for c in r) + " |")
-    return "\n".join(out) + "\n"
+        out.append("| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in r) + " |")
+    return "\n".join(out)
 
 
-def render_md(report_name, model, table_flags, issues, out_path):
-    ut = sorted(user_tables(model), key=lambda x: x["name"].lower())
-    ncols = sum(len(t.get("columns", [])) for t in ut)
-    L = [f"# {report_name}\n",
-         "_Generated from the Power BI semantic-model JSON._\n"]
+def _qual(table, col):
+    """Render a field as Table.Column dot notation, single-quoting any part with spaces/dots."""
+    if not table:
+        return ""
+    t = f"'{table}'" if re.search(r"[\s.]", str(table)) else str(table)
+    if not col:
+        return t
+    c = f"'{col}'" if re.search(r"[\s.\[\]]", str(col)) else str(col)
+    return f"{t}.{c}"
 
-    L.append(f"## Table Inventory ({len(ut)} Tables, {ncols} Columns)\n")
-    L.append(md_table(["Table", "Type", "Columns"],
-             [(t["name"], classify_table(t, model),
-               ", ".join(column_label(c) for c in t.get("columns", []))) for t in ut]))
 
-    L.append("## DAX Measure Inventory\n")
-    ms = measures(model)
-    L.append(md_table(["Measure", "Table", "Expression"], ms) if ms else "_No measures._\n")
+def _cardinality(r):
+    """Return (from_card, to_card) as 'one'/'many'. Defaults: from=many, to=one (TMDL default)."""
+    fc = str(_get(r, "fromcardinality", default="") or "").lower()
+    tc = str(_get(r, "tocardinality", default="") or "").lower()
+    combined = str(_get(r, "cardinality", default="") or "").lower()
+    if not fc and not tc and combined:
+        if "onetomany" in combined:
+            return "one", "many"
+        if "manytoone" in combined:
+            return "many", "one"
+        if "onetoone" in combined:
+            return "one", "one"
+        if "manytomany" in combined:
+            return "many", "many"
+    return (fc or "many"), (tc or "one")
 
-    L.append("## Relationship Map\n")
-    L.append(md_table(["Relationship", "Cardinality", "Issue"],
-             [(a, b, c) for (a, b, c, _) in relationship_rows(model)]))
 
-    L.append("## Parameters\n")
-    L.append(md_table(["Parameter", "Current Value"], parameters(model)))
 
-    L.append("## Transformation Inventory\n")
-    trows, _ = transformation_rows(model)
-    L.append(md_table(["Table", "Source", "Logic Type", "Key Transformation Detail"], trows))
 
-    L.append("## Performance Analysis\n")
-    L.append(md_table(["#", "Issue", "Root Cause", "Impact", "Priority"],
-             [(i["id"], i["title"], i["root"], i["impact"], i["prio"]) for i in issues]))
 
-    L.append("## Performance Mitigations\n")
-    mit = []
-    for i in issues:
-        m, how, why = MITIGATION_LIBRARY[i["key"]]
-        mit.append((i["id"], m, how, why))
-    L.append(md_table(["Issue", "Mitigation", "How", "Why"], mit))
+def _split_top(s, sep=","):
+    """Split on sep only at bracket depth 0."""
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
 
-    Path(out_path).write_text("\n".join(L), encoding="utf-8")
+
+def _format_sql(sql):
+    """Pretty-print SQL for human reading. Uses sqlparse if available, else a light fallback."""
+    if not sql:
+        return ""
+    try:
+        import sqlparse
+        return sqlparse.format(sql, reindent=True, keyword_case="upper", indent_width=2).strip()
+    except Exception:                                       # noqa: BLE001
+        s = re.sub(r"\s+", " ", sql).strip()
+        for kw in ("LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "FULL JOIN", "JOIN",
+                   "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "UNION ALL", "UNION"):
+            s = re.sub(r"\s+" + kw.replace(" ", r"\s+") + r"\b", "\n" + kw, s, flags=re.I)
+        s = re.sub(r"\bAND\b", "\n  AND", s, flags=re.I)
+        s = re.sub(r",\s*", ",\n       ", s, count=0)
+        return s
+
+
+def _sql_cell(sql):
+    """Format SQL for display inside a Markdown table cell (HTML <code> + <br>)."""
+    f = _format_sql(sql)
+    if not f:
+        return ""
+    f = f.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "<code>" + f.replace("\n", "<br>") + "</code>"
+
+
+def _extract_sql(e):
+    """Pull the native SQL out of a Sql.Database([Query="..."]) M expression."""
+    m = re.search(r'Query\s*=\s*"(.+?)"\s*(?:,\s*CommandTimeout|\])', e, re.S)
+    if not m:
+        return ""
+    sql = m.group(1).replace('""', '"')
+    return re.sub(r"\s+", " ", sql).strip()
+
+
+
+def _inventories(model):
+    """Return (table_rows, rel_rows, measure_rows, calccol_rows, transform_rows)."""
+    col_counts = {}
+    for c in model.get("schema", []):
+        t = _get(c, "tablename", "table", default="?")
+        col_counts[t] = col_counts.get(t, 0) + 1
+    table_rows = sorted(
+        ([t, ("System generated" if AUTO_TABLE_RE.match(t) else "User"), n]
+         for t, n in col_counts.items()), key=lambda r: (-r[2], r[0]))
+
+    rel_rows = []
+    for r in model.get("relationships", []):
+        xf = str(_get(r, "crossfilteringbehavior", "crossfilter", default="")).strip() or "?"
+        ft = _get(r, "fromtable", "fromtablename", default="?")
+        tt = _get(r, "totable", "totablename", default="?")
+        fc = _get(r, "fromcolumn", "fromcolumnname", default="")
+        tc = _get(r, "tocolumn", "tocolumnname", default="")
+        fcard, tcard = _cardinality(r)
+        card_label = {("many", "one"): "Many : One", ("one", "many"): "One : Many",
+                      ("one", "one"): "One : One", ("many", "many"): "Many : Many"}.get(
+                          (fcard, tcard), f"{fcard.title()} : {tcard.title()}")
+        join = f"{_qual(ft, fc)} -> {_qual(tt, tc)}" if (fc or tc) else f"{ft} -> {tt}"
+        rel_rows.append([join, card_label, xf, ""])
+
+    measure_rows = [[_get(m, "tablename", "table", default="?"),
+                     _get(m, "name", "measurename", default="?"),
+                     "",
+                     _expr_text(m, "expression", "expr")] for m in model.get("dax_measures", [])]
+    calccol_rows = [[_get(c, "tablename", "table", default="?"),
+                     _get(c, "columnname", "name", default="?"),
+                     "",
+                     _expr_text(c, "expression", "expr")] for c in model.get("dax_columns", [])]
+
+    transform_rows = []
+    for p in model.get("power_query", []):
+        e = _expr_text(p, "expression", "expr")
+        t = _get(p, "tablename", "table", default="?")
+        logic = []
+        if "Sql.Database" in e:
+            logic.append("Native SQL")
+        if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e):
+            logic.append("M merge")
+        if re.search(r"_translated|'fr'", e, re.I):
+            logic.append("Translated/FR")
+        if "CommandTimeout" in e:
+            logic.append("CommandTimeout")
+        transform_rows.append([t, " + ".join(logic) or "Passthrough"])
+    return table_rows, rel_rows, measure_rows, calccol_rows, transform_rows
+
+
+def render_report_md(name, model, report, findings):
+    from datetime import date
+    user_t = [t for t in model.get("tables", []) if not AUTO_TABLE_RE.match(t)]
+    auto_t = [t for t in model.get("tables", []) if AUTO_TABLE_RE.match(t)]
+    pages = report.get("pages", [])
+    total_vis = sum(len(p.get("visuals", [])) for p in pages)
+    total_slc = sum(len([v for v in p.get("visuals", []) if v.get("type") == "slicer"]) for p in pages)
+    sev_counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
+    size_mb = None
+    if isinstance(model.get("size_bytes"), (int, float)):
+        size_mb = f"{model['size_bytes'] / 1_048_576:.0f} MB"
+
+    L = []
+    L.append(f"# Power BI Performance Optimization Assessment")
+    L.append(f"### {name}")
+    L.append(f"_Prepared {date.today().isoformat()} · Confidential — for client review_\n")
+    L.append("---\n")
+
+    # 1. Executive Summary
+    L.append("## 1. Executive Summary\n")
+    L.append("This assessment reviews the semantic model and report layer of the subject report to "
+             "identify the drivers of elevated capacity (CU) consumption and to recommend prioritised, "
+             "evidence-based remediations. Findings are derived directly from the model and report "
+             "definition; impact is characterised structurally and is to be confirmed by measurement "
+             "(Section 9).\n")
+    L.append(_md_table(["Severity", "Findings"],
+             [[s.title(), sev_counts[s]] for s in SEV_ORDER] + [["**Total**", len(findings)]]))
+    L.append("")
+    quick = [f for f in findings if f["phase"] == 1]
+    if quick:
+        L.append("**Recommended immediate actions (low-risk quick wins):**\n")
+        for f in quick:
+            L.append(f"- **{f['id']} — {f['recommendation']}** ({f['effort']} effort, {f['risk']} risk)")
+        L.append("")
+    L.append("**Expected outcome:** reduced model size and refresh cost (background CU), faster page "
+             "render and interaction (interactive CU), and a simpler, more maintainable model.\n")
+    L.append("---\n")
+
+    # 2. Scope & Methodology
+    L.append("## 2. Scope & Methodology\n")
+    L.append("**In scope:** the report's semantic model (tables, relationships, DAX measures and "
+             "calculated columns, Power Query/M) and its report layer (pages, visuals, field usage).\n")
+    L.append("**Out of scope:** upstream data-source / Gold-layer ETL internals, and capacity sizing "
+             "decisions, except where a recommendation explicitly pushes work upstream.\n")
+    L.append("**Method:** the model was parsed programmatically and the report definition read "
+             "directly (visual definitions and per-visual field references). No change has been "
+             "applied to the model as part of this assessment.\n")
+    L.append("---\n")
+
+    # 3. As-Is Baseline
+    L.append("## 3. As-Is Baseline\n")
+    base = [
+        ["Report", name],
+        ["User tables", len(user_t)],
+        ["Auto-generated (date) tables", len(auto_t)],
+        ["Total columns", len(model.get("schema", []))],
+        ["Measures", len(model.get("dax_measures", []))],
+        ["Calculated columns", len(model.get("dax_columns", []))],
+        ["Relationships", len(model.get("relationships", []))],
+        ["Model size", size_mb or "n/a (run VertiPaq Analyzer)"],
+        ["Report pages", len(pages)],
+        ["Visuals (all pages)", total_vis],
+        ["Slicers (all pages)", total_slc],
+    ]
+    L.append("\n**CU baseline (to be completed):**\n")
+    L.append(_md_table(["Metric", "Value"],
+             [["Interactive CU (avg/peak)", "[[ REPLACE — from Fabric Capacity Metrics app ]]"],
+              ["Background CU (avg/peak)", "[[ REPLACE — from Fabric Capacity Metrics app ]]"],
+              ["Refresh duration", "[[ REPLACE ]]"],
+              ["Throttling observed?", "[[ REPLACE — Yes/No ]]"]]))
+    L.append("\n> _Capture the interactive-vs-background split from the Capacity Metrics app to anchor "
+             "before/after measurement; telemetry lag (~15–60 min) and smoothing apply._\n")
+    L.append("---\n")
+
+    # 4. As-Is Architecture & Inventories
+    trow, rrow, mrow, crow, xrow = _inventories(model)
+    L.append("## 4. As-Is Inventories\n")
+    L.append("### 4.1 Table Inventory\n")
+    L.append(_md_table(["Table", "Type", "Columns"], trow) if trow else "_No schema data._")
+    L.append("\n### 4.2 Relationship Map\n")
+    L.append(_md_table(["Relationship (from → to)", "Cardinality", "Cross-filter", "Description"], rrow)
+             if rrow else "_No relationships._")
+    L.append("\n### 4.3 Measures\n")
+    L.append(_md_table(["Table", "Measure", "Description", "Expression"],
+             [[r[0], r[1], r[2], f"`{r[3]}`"] for r in mrow]) if mrow else "_No measures._")
+    L.append("\n### 4.4 Calculated Columns\n")
+    L.append(_md_table(["Table", "Column", "Description", "Expression"],
+             [[r[0], r[1], r[2], f"`{r[3]}`"] for r in crow]) if crow else "_No calculated columns._")
+    L.append("\n### 4.5 Transformation Inventory\n")
+    if xrow:
+        L.append("_Logic tags: **Native SQL** = query sent to the source; **M merge** = joins done "
+                 "locally in Power Query (do not fold); **Translated/FR** = calls translated('fr') for "
+                 "bilingual columns; **CommandTimeout** = extended source-query timeout set._\n")
+        sqlmap = {_get(p, "tablename", "table", default="?"):
+                  _sql_cell(_extract_sql(_expr_text(p, "expression", "expr")))
+                  for p in model.get("power_query", [])}
+        rows = [[t, logic, sqlmap.get(t, "")] for (t, logic) in xrow]
+        L.append(_md_table(["Table", "Logic", "Source SQL"], rows))
+    else:
+        L.append("_No partition expressions._")
+    L.append("\n---\n")
+
+    # 5. Findings
+    L.append("## 5. Findings\n")
+    if not findings:
+        L.append("_No rule-based issues detected._\n")
+    for f in findings:
+        L.append(f"### {f['id']} · {f['title']}")
+        L.append(_md_table(["Severity", "Category", "Owning layer"],
+                 [[f["severity"], f["category"], f["layer"]]]))
+        L.append("\n**Evidence**")
+        for b in _bullets(f["evidence"]):
+            L.append(f"- {b}")
+        L.append("\n**Impact**")
+        for b in _bullets(f["impact"]):
+            L.append(f"- {b}")
+        L.append("\n**Recommendation**")
+        for b in _bullets(f["recommendation"]):
+            L.append(f"- {b}")
+        L.append("")
+    L.append("---\n")
+
+    # 6. Recommendations
+    L.append("## 6. Recommendations\n")
+    rec_rows = [[f["id"], f["recommendation"], f["layer"], f["effort"], f["risk"], f"P{f['phase']}"]
+                for f in findings]
+    L.append(_md_table(["Finding", "Recommendation", "Layer", "Effort", "Risk", "Phase"], rec_rows)
+             if rec_rows else "_None._")
+    L.append("\n---\n")
+
+    # 7. Prioritization
+    L.append("## 7. Prioritization\n")
+    qw = [f for f in findings if f["phase"] == 1]
+    st = [f for f in findings if f["phase"] != 1]
+    L.append("### 7.1 Quick wins (safe, do now)\n")
+    L.append(_md_table(["Finding", "Action", "Effort", "Risk"],
+             [[f["id"], f["recommendation"], f["effort"], f["risk"]] for f in qw]) if qw else "_None._")
+    L.append("\n### 7.2 Strategic (design / source work)\n")
+    L.append(_md_table(["Finding", "Action", "Effort", "Risk"],
+             [[f["id"], f["recommendation"], f["effort"], f["risk"]] for f in st]) if st else "_None._")
+    L.append("\n---\n")
+
+    # 8. To-Be
+    L.append("## 8. Proposed To-Be State\n")
+    seen = set()
+    for f in findings:
+        if f["tobe"] and f["tobe"] not in seen:
+            seen.add(f["tobe"])
+            L.append(f"- {f['tobe']}")
+    L.append("\n---\n")
+
+    # 9. Validation
+    L.append("## 9. Validation & Measurement Plan\n")
+    L.append("- **Model size:** VertiPaq Analyzer (DAX Studio) — capture total and per-column size before "
+             "and after each change.\n"
+             "- **Query/render time:** Performance Analyzer on the heaviest page — record DAX query "
+             "durations before and after.\n"
+             "- **Capacity (CU):** Fabric Capacity Metrics app — compare interactive vs background CU for "
+             "the model's operations, allowing for telemetry lag and smoothing.\n"
+             "- **Regression:** confirm visual outputs and slicer behaviour are unchanged after each fix.\n")
+    L.append("---\n")
+
+    # 10. Roadmap
+    L.append("## 10. Roadmap\n")
+    L.append("- **Phase 1 — Quick wins (no source changes):** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 1) or "—") + "\n"
+             "- **Phase 2 — Source / model rework:** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 2) or "—") + "\n"
+             "- **Phase 3 — Report redesign:** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 3) or "—") + "\n")
+    L.append("---\n")
+
+    # 11. Appendix
+    L.append("## 11. Appendix\n")
+    if model.get("error"):
+        L.append(f"- **Model extraction note:** {model['error']}")
+    if report.get("error"):
+        L.append(f"- **Report extraction note:** {report['error']}")
+    L.append("- **Glossary:** CU = Capacity Unit; VertiPaq = the in-memory columnar storage engine; "
+             "query folding = pushing Power Query steps to the source as native SQL; interactive CU = "
+             "cost of querying/rendering; background CU = cost of refresh.")
+    L.append("")
+    return "\n".join(L)
 
 
 # --------------------------------------------------------------------------- #
+
+
+def process_one(pbix_path, out_dir, report_only=None):
+    """Analyse one .pbix and write its own .assessment.md.
+    Returns a summary dict (never raises - failures are captured)."""
+    name = Path(pbix_path).stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model = extract_model(pbix_path)
+        report = extract_visuals(report_only) if report_only else extract_visuals(pbix_path)
+        findings = detect(model, report)
+
+        (out_dir / f"{name}.assessment.md").write_text(
+            render_report_md(name, model, report, findings), encoding="utf-8")
+
+        sev = {}
+        for f in findings:
+            sev[f["severity"]] = sev.get(f["severity"], 0) + 1
+        print(f"  [OK]  {name}: {len(findings)} findings "
+              f"({', '.join(f'{k}={v}' for k, v in sev.items()) or 'none'}) -> {name}.assessment.md")
+        return {"name": name, "status": "ok", "findings": len(findings),
+                "critical": sev.get("CRITICAL", 0), "high": sev.get("HIGH", 0),
+                "medium": sev.get("MEDIUM", 0), "low": sev.get("LOW", 0),
+                "model_error": model.get("error", ""), "report_error": report.get("error", "")}
+    except Exception as e:                                   # noqa: BLE001 - keep the batch alive
+        print(f"  [FAIL] {name}: {e}")
+        return {"name": name, "status": "failed", "findings": 0,
+                "critical": 0, "high": 0, "medium": 0, "low": 0, "error": str(e)}
+
+
+def write_index(out_dir, summaries):
+    """Roll-up index across all reports in a batch."""
+    from datetime import date
+    rows = []
+    for s in sorted(summaries, key=lambda x: (-x.get("critical", 0), -x.get("high", 0), x["name"])):
+        link = f"[{s['name']}]({s['name']}.assessment.md)" if s["status"] == "ok" else s["name"]
+        note = s.get("error") or s.get("model_error") or "-"
+        rows.append([link, s["status"], s["findings"], s.get("critical", 0),
+                     s.get("high", 0), s.get("medium", 0), s.get("low", 0), note])
+    ok = sum(1 for s in summaries if s["status"] == "ok")
+    failed = sum(1 for s in summaries if s["status"] == "failed")
+    L = ["# Power BI Portfolio Assessment - Index",
+         f"_Prepared {date.today().isoformat()} · {len(summaries)} report(s): {ok} succeeded, {failed} failed_\n",
+         _md_table(["Report", "Status", "Findings", "Crit", "High", "Med", "Low", "Note"], rows),
+         "\nEach report has its own `<name>.assessment.md` (full detail) and `<name>.facts.json` (raw facts)."]
+    (out_dir / "INDEX.md").write_text("\n".join(L), encoding="utf-8")
+    print(f"  Index: INDEX.md ({ok} ok, {failed} failed)")
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Generate a BRD-style report section from a Power BI model JSON.")
-    ap.add_argument("json", help="Path to the semantic-model JSON (e.g. database.json)")
-    ap.add_argument("-o", "--output", help="Explicit output file path (overrides --output-dir)")
-    ap.add_argument("--output-dir", default="reports",
-                    help="Folder to write reports into (default: reports). "
-                         "Files are named after the report.")
-    ap.add_argument("--format", choices=["docx", "md"], default="docx")
+    ap = argparse.ArgumentParser(description="Extract perf facts + a consultant-style assessment from .pbix file(s).")
+    ap.add_argument("path", help="A .pbix file, OR a folder containing .pbix files.")
+    ap.add_argument("-o", "--out", default="perf_out", help="Output folder (default: perf_out)")
+    ap.add_argument("-r", "--recursive", action="store_true",
+                    help="Recurse into subfolders when a folder is given.")
+    ap.add_argument("--report-only", help="Read visuals from this extracted Report/PBIP folder "
+                                          "instead of the .pbix (model still from the .pbix).")
     args = ap.parse_args()
 
-    model, name = load_model(args.json)
-    report_name = re.sub(r"[ _]+", " ", name).strip()
+    p = Path(args.path)
+    out = Path(args.out)
 
-    _, table_flags = transformation_rows(model)
-    issues = analyse_performance(model, table_flags)
-
-    if args.output:
-        out = Path(args.output)
+    if p.is_dir() and not args.report_only:
+        pbix = sorted(p.rglob("*.pbix") if args.recursive else p.glob("*.pbix"))
+        if not pbix:
+            where = "folder tree" if args.recursive else "folder"
+            print(f"No .pbix files found in {where}: {p}")
+            sys.exit(1)
+        print(f"Scanning {len(pbix)} .pbix file(s) in {p}{' (recursive)' if args.recursive else ''}...")
+        summaries = [process_one(f, out) for f in pbix]
+        write_index(out, summaries)
     else:
-        out = Path(args.output_dir) / f"{safe_filename(report_name)}.{args.format}"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out = str(out)
-
-    if args.format == "docx":
-        render_docx(report_name, model, table_flags, issues, out)
-    else:
-        render_md(report_name, model, table_flags, issues, out)
-
-    print(f"✓ Generated {args.format.upper()} report: {out}")
-    print(f"  Report:        {report_name}")
-    print(f"  Tables:        {len(user_tables(model))} user tables")
-    print(f"  Measures:      {len(measures(model))}")
-    print(f"  Relationships: {len(relationship_rows(model))}")
-    print(f"  Issues found:  {len(issues)}  ({', '.join(i['id']+'='+i['prio'] for i in issues)})")
+        print("Scanning 1 file...")
+        process_one(p, out, report_only=args.report_only)
+    print(f"Done. Output written to: {out}/")
 
 
 if __name__ == "__main__":
