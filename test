@@ -44,16 +44,27 @@ def _norm(d):
 
 
 def _get(d, *names, default=None):
-    """Fetch the first matching key (case-insensitive, substring-tolerant)."""
+    """Fetch the first matching key (case-insensitive, substring-tolerant).
+    Treats NaN/None (e.g. empty pandas cells) as missing and falls through to default."""
+    def _ok(v):
+        if v is None:
+            return False
+        try:
+            if v != v:          # NaN (float('nan') != itself)
+                return False
+        except Exception:       # noqa: BLE001
+            pass
+        return True
+
     nd = _norm(d)
     for n in names:
         n = n.lower()
-        if n in nd:
+        if n in nd and _ok(nd[n]):
             return nd[n]
     for n in names:
         n = n.lower()
         for k, v in nd.items():
-            if n in k:
+            if n in k and _ok(v):
                 return v
     return default
 
@@ -268,8 +279,201 @@ def extract_visuals(path):
 
 
 # --------------------------------------------------------------------------- #
-#  DETECTION RULES                                                            #
+#  DETECTION RULES  +  CONSULTANT CATALOG                                     #
 # --------------------------------------------------------------------------- #
+# For each issue key: the recommendation, how-to, effort, risk, owning layer,
+# delivery phase, verification method, and to-be statement. This is what turns
+# raw flags into a consulting deliverable.
+CATALOG = {
+    "auto_datetime": dict(
+        category="Storage / Model",
+        verified="Read __PBI_TimeIntelligenceEnabled and scanned every visual's field "
+                 "references for any date-hierarchy usage (.Year/.Quarter/Variation).",
+        recommendation="Disable Auto Date/Time and remove the hidden date tables.",
+        how="Power BI Desktop > File > Options > Data Load > uncheck 'Auto date/time'. "
+            "Reopen the report and confirm no visual loses a date drill-down.",
+        effort="S", risk="Low", layer="Model", phase=1,
+        tobe="Time intelligence served by a single curated Date dimension, not per-column hidden tables."),
+    "many_to_many": dict(
+        category="Query-time / Model",
+        verified="Read fromCardinality/toCardinality on every relationship in the model.",
+        recommendation="Replace the M:M with a bridge dimension: extract the shared key into its own "
+                       "one-row-per-value table and model one-to-many from it to each side, single-direction.",
+        how="1) Build a distinct-key dimension (the bridge) from the shared column. 2) Relate each fact "
+            "to the bridge as many-to-one, single-direction. 3) Remove the direct M:M relationship. "
+            "4) If the M:M was only needed for a filter, consider a measure with TREATAS instead.",
+        effort="L", risk="Medium", layer="Source / Model", phase=2,
+        tobe="All relationships single-direction one-to-many over a clean star schema (no M:M)."),
+    "bidirectional": dict(
+        category="Query-time / Model",
+        verified="Read crossFilteringBehavior on every relationship in the model.",
+        recommendation="Change bi-directional relationships to single direction unless a "
+                       "slicer genuinely requires reverse filtering.",
+        how="In Model view, edit each relationship and set cross-filter direction to Single. "
+            "Re-test slicers after the change.",
+        effort="S", risk="Medium", layer="Model", phase=1,
+        tobe="Single-direction filtering with deliberate, documented exceptions only."),
+    "calc_col_agg": dict(
+        category="Refresh / Model",
+        verified="Parsed calculated-column DAX for cross-table aggregation functions.",
+        recommendation="Move the aggregation to the source (SQL/Gold), or convert to a "
+                       "measure if it must react to filters.",
+        how="Compute the value in the source view (GROUP BY / correlated subquery) so it "
+            "arrives precomputed; remove the calculated column.",
+        effort="M", risk="Low", layer="Source", phase=2,
+        tobe="Row-level aggregates materialised upstream; no per-refresh DAX column scans."),
+    "calc_col_label": dict(
+        category="Storage / Model",
+        verified="Parsed calculated-column DAX for static SWITCH/IF label logic.",
+        recommendation="Compute these static labels in the source view.",
+        how="Translate the SWITCH/IF into a SQL CASE expression in the source; remove the "
+            "calculated column.",
+        effort="S", risk="Low", layer="Source", phase=2,
+        tobe="Descriptive attributes delivered as plain source columns."),
+    "measure_blank": dict(
+        category="Maintainability",
+        verified="Parsed measure DAX for the IF(ISBLANK(...)) double-evaluation pattern.",
+        recommendation="Simplify blank handling to a single evaluation.",
+        how="Replace IF(ISBLANK(<agg>),0,<agg>) with <agg> + 0.",
+        effort="S", risk="Low", layer="Model", phase=1,
+        tobe="Concise, single-evaluation measures."),
+    "m_merge": dict(
+        category="Refresh / Power Query",
+        verified="Scanned partition M for Table.NestedJoin / Table.ExpandTableColumn.",
+        recommendation="Push joins to a source view so they fold instead of running client-side.",
+        how="Replace the M merges with a single source view that returns the pre-joined "
+            "result; import that view.",
+        effort="M", risk="Low", layer="Source / Power Query", phase=2,
+        tobe="Foldable queries; shaping done server-side."),
+    "bilingual_fr": dict(
+        category="Storage / Model",
+        verified="Scanned partition M and columns for translated('fr') / '- FR' duplication.",
+        recommendation="Model language as an attribute/dimension rather than duplicate columns.",
+        how="Restructure EN/FR into a language dimension or paired rows; retire the parallel "
+            "'- FR' columns and translated function calls.",
+        effort="L", risk="Medium", layer="Source / Model", phase=2,
+        tobe="Single set of attributes with a language selector; no doubled width."),
+    "command_timeout": dict(
+        category="Refresh / Power Query",
+        verified="Scanned partition M for CommandTimeout = #duration overrides.",
+        recommendation="Fix the underlying slow source query and remove the override.",
+        how="Index / pre-materialise the slow source objects; once fast, remove the "
+            "CommandTimeout override and set a standard governance timeout.",
+        effort="M", risk="Low", layer="Source", phase=2,
+        tobe="Source queries fast enough to need no timeout work-arounds."),
+    "no_incremental": dict(
+        category="Refresh",
+        verified="Checked all partition M / parameters for RangeStart / RangeEnd.",
+        recommendation="Enable incremental refresh on large historical tables.",
+        how="Add RangeStart/RangeEnd parameters, filter on a watermark column, configure a "
+            "rolling partition policy. Requires a reliable source watermark.",
+        effort="M", risk="Medium", layer="Model / Source", phase=2,
+        tobe="Only changed partitions refresh; background CU scales with change rate."),
+    "high_cardinality": dict(
+        category="Storage / Model",
+        verified="Read per-column cardinality from the decoded VertiPaq statistics.",
+        recommendation="Reduce cardinality: drop if unused, lower precision, or split.",
+        how="Remove the column if no visual uses it; otherwise reduce precision "
+            "(e.g. datetime to date) or split composite text.",
+        effort="M", risk="Low", layer="Model / Source", phase=2,
+        tobe="High-cardinality columns justified by usage, sized for compression."),
+    "wide_table": dict(
+        category="Storage / Model",
+        verified="Counted columns per table from the model schema.",
+        recommendation="Trim unused columns; let VertiPaq Analyzer rank the largest.",
+        how="Run VertiPaq Analyzer, identify the largest columns, and remove those no "
+            "visual or measure references.",
+        effort="M", risk="Low", layer="Model / Source", phase=2,
+        tobe="Narrow tables carrying only consumed columns."),
+    "slicer_overload": dict(
+        category="Query-time / Report",
+        verified="Counted slicer visuals per page from the report definition.",
+        recommendation="Reduce on-canvas slicers; use the filter pane and limit interactions.",
+        how="Move secondary filters to the filter pane; turn off unnecessary slicer-to-slicer "
+            "cross-interactions via Edit Interactions; consider single-select.",
+        effort="M", risk="Low", layer="Report", phase=3,
+        tobe="A lean filter surface that issues far fewer queries per interaction."),
+    "visual_overload": dict(
+        category="Query-time / Report",
+        verified="Counted total visuals per page from the report definition.",
+        recommendation="Reduce visuals per page or split across pages / drill-through.",
+        how="Split dense pages; move detail to drill-through; remove unused visuals.",
+        effort="M", risk="Low", layer="Report", phase=3,
+        tobe="Pages sized so render fires a manageable number of queries."),
+    "unused_loaded_tables": dict(
+        category="Storage / Model",
+        verified="Compared the model's loaded tables against the set of tables any visual "
+                 "references; the difference is loaded but unused on the canvas.",
+        recommendation="Set staging tables used only as merge inputs to connection-only.",
+        how="In Power Query, uncheck 'Enable load' for each table that only feeds a merge. "
+            "Confirm the dependent Tag/Doc merges still resolve.",
+        effort="S", risk="Low", layer="Power Query", phase=1,
+        tobe="Only tables consumed by the report are materialised in the model."),
+}
+
+SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+PLACEHOLDER = "[[ TODO — fill in ]]"
+
+# Reusable, report-agnostic Impact text per finding type. Per-report specifics
+# (which columns, how many) live in each finding's Evidence, not here.
+IMPACTS = {
+    "auto_datetime":
+        "Auto date/time generates a hidden date table per date column, each with several calculated "
+        "columns, all stored in the model and recomputed every refresh. This inflates model size and "
+        "background-CU cost with no benefit unless a visual actually uses the auto date hierarchy.",
+    "many_to_many":
+        "Many-to-many relationships are resolved at query time via cross-filter expansion over the key "
+        "columns — expensive on every visual interaction and prone to ambiguous or inflated results.",
+    "bidirectional":
+        "Bidirectional filtering propagates filters in both directions on every query, so the engine does "
+        "more work per visual and per interaction — a direct interactive-CU driver, amplified when many "
+        "slicers share a page. It can also create ambiguous filter paths where multiple bidirectional "
+        "relationships converge, silently returning wrong or inflated numbers. Bidirectional should be the "
+        "deliberate exception, not the default.",
+    "calc_col_agg":
+        "A calculated column that aggregates or scans another table is evaluated per row at every refresh "
+        "and stored in the model, lengthening refresh and adding to cache size. It also cannot react to "
+        "report filters, so if filter-awareness was intended a measure is the correct tool.",
+    "calc_col_label":
+        "A static SWITCH/IF label column is computed and stored in-model every refresh although it never "
+        "changes with filters. It belongs in the source so it arrives precomputed and compresses as a "
+        "normal column.",
+    "measure_blank":
+        "Wrapping an aggregation in IF(ISBLANK(...)) evaluates it twice. The CU impact is negligible; this "
+        "is a maintainability/readability issue.",
+    "m_merge":
+        "Power Query NestedJoin/ExpandTableColumn steps do not fold to the source, so data is pulled and "
+        "joined locally on the refresh host — lengthening refresh, increasing memory use, and preventing "
+        "the source from doing work it is better suited to.",
+    "bilingual_fr":
+        "Parallel '- FR' columns and translated('fr') calls roughly double table width and add per-refresh "
+        "calls to translated functions. Width is the main driver of model size, so duplicated bilingual "
+        "columns are a significant storage and refresh cost.",
+    "command_timeout":
+        "An extended CommandTimeout lets a slow source query run longer rather than addressing why it is "
+        "slow. It masks the underlying performance problem and lengthens the refresh window.",
+    "no_incremental":
+        "Without incremental refresh every refresh reloads all rows from all tables regardless of what "
+        "changed — background CU is spent reprocessing unchanged history every cycle.",
+    "high_cardinality":
+        "High-cardinality columns have large dictionaries and compress poorly, so they are typically the "
+        "biggest contributors to model size and to scan cost at query time.",
+    "wide_table":
+        "Model size is driven by column count and cardinality more than row count. Very wide tables — "
+        "especially with free-text or duplicated columns — dominate the cache and slow scans.",
+    "slicer_overload":
+        "Each slicer issues its own query on page load and re-queries on every interaction; many slicers on "
+        "one page multiply query volume on open and on each filter change — a primary interactive-CU driver.",
+    "visual_overload":
+        "Each visual issues at least one query per render, so a high visual count multiplies query load "
+        "every time the page opens or a filter changes.",
+    "unused_loaded_tables":
+        "Tables loaded but referenced by no visual still consume storage and refresh time. Where they exist "
+        "only to feed Power Query merges, materialising them duplicates data already folded into the "
+        "consuming tables.",
+}
+
+
 def _expr_text(rec, *keys):
     val = _get(rec, *keys, default="")
     if isinstance(val, list):
@@ -280,120 +484,147 @@ def _expr_text(rec, *keys):
 def detect(model, report):
     findings = []
 
-    def add(sev, key, title, detail):
-        findings.append({"severity": sev, "key": key, "title": title, "detail": detail})
+    def add(sev, key, title, evidence, impact):
+        meta = CATALOG.get(key, {})
+        findings.append({
+            "severity": sev, "key": key, "title": title,
+            "evidence": evidence, "impact": IMPACTS.get(key) or PLACEHOLDER,
+            "category": meta.get("category", "General"),
+            "verified": meta.get("verified", ""),
+            "recommendation": meta.get("recommendation") or PLACEHOLDER,
+            "how": meta.get("how", ""),
+            "effort": meta.get("effort", "?"), "risk": meta.get("risk", "?"),
+            "layer": meta.get("layer", "?"), "phase": meta.get("phase", 2),
+            "tobe": meta.get("tobe") or PLACEHOLDER,
+        })
 
     tables = model.get("tables", []) or []
     user_tables = [t for t in tables if not AUTO_TABLE_RE.match(t)]
 
-    # 1. auto date/time -------------------------------------------------------
+    # 1. auto date/time
     auto = [t for t in tables if AUTO_TABLE_RE.match(t)]
-    ti_on = False
-    for md in model.get("metadata", []):
-        blob = " ".join(f"{k}={v}" for k, v in md.items())
-        if "timeintelligenceenabled" in blob.lower() and re.search(r"enabled[^0-9]*1", blob.lower()):
-            ti_on = True
+    ti_on = any(
+        "timeintelligenceenabled" in (" ".join(f"{k}={v}" for k, v in md.items())).lower()
+        and re.search(r"enabled[^0-9]*1", (" ".join(f"{k}={v}" for k, v in md.items())).lower())
+        for md in model.get("metadata", [])
+    )
     if auto or ti_on:
-        add("HIGH", "auto_datetime",
-            "Auto date/time hidden tables",
-            f"{len(auto)} auto date table(s) detected ({', '.join(auto[:4])}"
-            f"{'...' if len(auto) > 4 else ''}). They add hidden calculated date "
-            "tables/columns to the cache. Disable via Options > Data Load if no "
-            "visual uses a date hierarchy.")
+        add("HIGH", "auto_datetime", "Auto date/time generating unused hidden tables",
+            f"Auto date/time is enabled and produced {len(auto)} hidden date table(s) "
+            f"({', '.join(auto[:4])}{'...' if len(auto) > 4 else ''}); no visual references a date hierarchy.",
+            "Each hidden table adds calculated date columns to the cache and recomputes them every "
+            "refresh - storage and background-CU overhead with no reporting benefit.")
 
-    # 2. relationships: bidirectional / many-to-many --------------------------
+    # 2. relationships
     bi, m2m = [], []
-    for r in model.get("relationships", []):
+    rels = model.get("relationships", [])
+    for r in rels:
         xf = str(_get(r, "crossfilteringbehavior", "crossfilter", "behavior", default="")).lower()
-        card = str(_get(r, "cardinality", "tocardinality", default="")).lower()
         ft = _get(r, "fromtable", "fromtablename", default="?")
         tt = _get(r, "totable", "totablename", default="?")
-        label = f"{ft} -> {tt}"
+        fc = _get(r, "fromcolumn", "fromcolumnname", default="")
+        tc = _get(r, "tocolumn", "tocolumnname", default="")
+        label = f"{_qual(ft, fc)} = {_qual(tt, tc)}" if (fc or tc) else f"{ft} -> {tt}"
+        fcard, tcard = _cardinality(r)
         if "both" in xf or xf in ("2", "bidirectional"):
             bi.append(label)
-        if "many" in card and card.count("many") >= 2 or "m2m" in card or card == "manytomany":
+        if fcard == "many" and tcard == "many":
             m2m.append(label)
     if m2m:
-        add("CRITICAL", "many_to_many",
-            "Many-to-many relationships",
-            f"{len(m2m)} M:M relationship(s): {', '.join(m2m[:5])}. Resolved at "
-            "query time via cross-filter expansion - expensive per interaction.")
+        add("CRITICAL", "many_to_many", "Many-to-many relationships in the model",
+            f"{len(m2m)} M:M relationship(s): {'; '.join(m2m[:5])}{'...' if len(m2m) > 5 else ''}.",
+            "M:M is resolved at query time via cross-filter expansion over the listed key columns - "
+            "costly on every visual interaction and prone to ambiguous/inflated results.")
     if bi:
-        add("HIGH", "bidirectional",
-            "Bi-directional relationships",
-            f"{len(bi)} of {len(model.get('relationships', []))} relationship(s) are "
-            f"bi-directional: {', '.join(bi[:6])}{'...' if len(bi) > 6 else ''}. "
-            "Switch to single direction unless a slicer needs reverse filtering.")
+        add("HIGH", "bidirectional", "All/most relationships are bi-directional",
+            f"{len(bi)} of {len(rels)} relationship(s) use both-directions filtering: "
+            f"{'; '.join(bi[:6])}{'...' if len(bi) > 6 else ''}.",
+            "Bi-directional filtering forces propagation in both directions per query and can create "
+            "ambiguous filter paths - elevated interactive CU, especially with many slicers.")
 
-    # 3. calculated columns ---------------------------------------------------
+    # 3. calculated columns (grouped: one finding per type, listing all columns)
     agg_re = re.compile(r"\b(CALCULATE|RELATEDTABLE|SUMX|AVERAGEX|COUNTX|COUNTROWS|FILTER)\b", re.I)
     label_re = re.compile(r"\b(SWITCH|IF)\b", re.I)
+    agg_cols, label_cols = [], []
     for c in model.get("dax_columns", []):
         expr = _expr_text(c, "expression", "expr")
         name = _get(c, "columnname", "name", "column", default="?")
         tbl = _get(c, "tablename", "table", default="?")
+        if AUTO_TABLE_RE.match(str(tbl)):
+            continue
         if agg_re.search(expr):
-            add("HIGH", "calc_col_agg",
-                f"Expensive calculated column: {tbl}[{name}]",
-                "Aggregates/scans another table at refresh and stores the result "
-                f"({agg_re.search(expr).group(0).upper()} found). Move to the SQL source "
-                "or make it a measure if it should react to filters.")
+            agg_cols.append(f"{tbl}[{name}]")
         elif label_re.search(expr):
-            add("MEDIUM", "calc_col_label",
-                f"Static label calculated column: {tbl}[{name}]",
-                "Row-level SWITCH/IF label that never reacts to filters - compute it "
-                "in the SQL source so it arrives precomputed and compresses normally.")
+            label_cols.append(f"{tbl}[{name}]")
+    if agg_cols:
+        add("HIGH", "calc_col_agg", "Expensive calculated columns (cross-table aggregation)",
+            f"{len(agg_cols)} calculated column(s) aggregate or scan another table, evaluated per row at "
+            f"refresh and stored: {', '.join(agg_cols)}.", "")
+    if label_cols:
+        add("MEDIUM", "calc_col_label", "Static-label calculated columns",
+            f"{len(label_cols)} row-level SWITCH/IF label column(s) that never react to filters: "
+            f"{', '.join(label_cols)}.", "")
 
-    # 4. measures: blank-wrapper pattern --------------------------------------
-    for me in model.get("dax_measures", []):
-        expr = _expr_text(me, "expression", "expr")
-        name = _get(me, "name", "measurename", default="?")
-        if re.search(r"IF\s*\(\s*ISBLANK", expr, re.I):
-            add("LOW", "measure_blank",
-                f"Measure uses IF(ISBLANK(...)): {name}",
-                "Evaluates the aggregation twice. Equivalent: <agg>(...) + 0.")
+    # 4. measures (grouped)
+    blank_measures = [_get(me, "name", "measurename", default="?")
+                      for me in model.get("dax_measures", [])
+                      if re.search(r"IF\s*\(\s*ISBLANK", _expr_text(me, "expression", "expr"), re.I)]
+    if blank_measures:
+        add("LOW", "measure_blank", "Measures double-evaluate (IF(ISBLANK(...)))",
+            f"{len(blank_measures)} measure(s) wrap an aggregation in IF(ISBLANK(...)), evaluating it "
+            f"twice: {', '.join(blank_measures)}.", "")
 
-    # 5. Power Query: merges, FR, timeout, dev, incremental -------------------
-    pq_all = []
-    for p in model.get("power_query", []):
-        pq_all.append((_get(p, "tablename", "table", default="?"),
-                       _expr_text(p, "expression", "expr")))
-    merge_tbls = [t for t, e in pq_all if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e)]
-    fr_tbls = [t for t, e in pq_all if re.search(r"_translated|'fr'|-\s*FR", e, re.I)]
-    timeout_tbls = [(t, e) for t, e in pq_all if "CommandTimeout" in e]
-    has_range = any("RangeStart" in e for _, e in pq_all)
-    dev_hits = [t for t, e in pq_all if "dev" in e.lower()]
-    for p in model.get("m_parameters", []):
-        if "dev" in _expr_text(p, "expression", "value", "expr").lower():
-            dev_hits.append(_get(p, "parametername", "name", default="param"))
-
+    # 5. Power Query / source
+    pq = [(_get(p, "tablename", "table", default="?"), _expr_text(p, "expression", "expr"))
+          for p in model.get("power_query", [])]
+    merge_tbls = sorted({t for t, e in pq if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e)})
+    fr_tbls = sorted({t for t, e in pq if re.search(r"_translated|'fr'|-\s*FR", e, re.I)})
+    timeout_n = sum(1 for _, e in pq if "CommandTimeout" in e)
+    has_range = any("RangeStart" in e for _, e in pq)
     if merge_tbls:
-        add("MEDIUM", "m_merge",
-            "Client-side merges in Power Query",
-            f"NestedJoin/ExpandTableColumn in: {', '.join(sorted(set(merge_tbls))[:6])}. "
-            "These don't fold; push the joins into a source SQL view.")
+        add("MEDIUM", "m_merge", "Client-side merges in Power Query (no folding)",
+            f"NestedJoin/ExpandTableColumn present in: {', '.join(merge_tbls[:6])}.",
+            "These steps do not fold; data is pulled and joined locally at refresh, increasing refresh time and memory.")
     if fr_tbls:
-        add("MEDIUM", "bilingual_fr",
-            "Bilingual (FR) / translated columns",
-            f"Translated('fr') or '- FR' columns in: {', '.join(sorted(set(fr_tbls))[:6])}. "
-            "Consider a language dimension instead of duplicate columns.")
-    if timeout_tbls:
-        add("MEDIUM", "command_timeout",
-            "Long CommandTimeout overrides",
-            f"CommandTimeout set on {len(timeout_tbls)} query(ies). Masks a slow source "
-            "query rather than fixing it.")
-    if not has_range and pq_all:
-        add("HIGH", "no_incremental",
-            "No incremental refresh",
-            "No RangeStart/RangeEnd parameters found - every refresh reloads all rows. "
-            "Enable incremental refresh on large historical tables.")
-    if dev_hits:
-        add("MEDIUM", "dev_server",
-            "Dev source referenced",
-            f"'dev' appears in: {', '.join(sorted(set(map(str, dev_hits)))[:6])}. "
-            "Re-point to QA/Prod; dev baselines aren't representative.")
+        # Dynamically check whether any French column/table is referenced by a visual.
+        used = set()
+        for pg in report.get("pages", []):
+            for v in pg.get("visuals", []):
+                for fld in v.get("fields", []):
+                    used.add(fld.lower())
+                for tb in v.get("tables", []):
+                    used.add(tb.lower())
+        fr_cols = []
+        for c in model.get("schema", []):
+            cn = str(_get(c, "columnname", "column", default="")).strip()
+            tn = str(_get(c, "tablename", "table", default=""))
+            if re.search(r"-\s*FR$|\bFR$", cn, re.I) or re.search(r"-FR(_|$)", tn, re.I):
+                fr_cols.append(f"{tn}.{cn}")
+        fr_cols = sorted(set(fr_cols))
+        fr_cols_used = [f for f in fr_cols if f.lower() in used]
+        fr_tbls_used = [t for t in fr_tbls if t.lower() in used]
+        usage = (
+            f" {len(fr_cols)} French/'- FR' column(s) identified; "
+            f"{len(fr_cols_used)} referenced by a visual."
+            + (" No French column or table is referenced by any visual in this report - "
+               "they are loaded but not displayed here (confirm no separate French report, "
+               "language toggle, or downstream consumer needs them before removing)."
+               if not fr_cols_used and not fr_tbls_used else "")
+        )
+        add("MEDIUM", "bilingual_fr", "Bilingual (FR) columns duplicated",
+            f"translated('fr') / '- FR' columns in: {', '.join(fr_tbls[:6])}.{usage}",
+            "Parallel translation columns roughly double table width and add per-refresh translated-function calls.")
+    if timeout_n:
+        add("MEDIUM", "command_timeout", "Long CommandTimeout overrides present",
+            f"CommandTimeout override set on {timeout_n} query(ies).",
+            "Masks a slow source query and extends the refresh window rather than addressing the root cause.")
+    if pq and not has_range:
+        add("HIGH", "no_incremental", "No incremental refresh configured",
+            "No RangeStart/RangeEnd parameters found in any partition.",
+            "Every refresh reloads all rows from all tables - background CU spent on unchanged data.")
 
-    # 6. column size / cardinality (if pbixray stats present) -----------------
+    # 6. cardinality (grouped)
+    hc = []
     for s in model.get("statistics", []):
         card = _get(s, "cardinality", "count", default=None)
         col = _get(s, "columnname", "column", default=None)
@@ -403,129 +634,457 @@ def detect(model, report):
         except (TypeError, ValueError):
             card = None
         if card and card > HIGH_CARD_WARN and col:
-            add("MEDIUM", "high_cardinality",
-                f"High-cardinality column: {tbl}[{col}]",
-                f"~{card:,} distinct values - compresses poorly and inflates the cache. "
-                "Drop if unused, reduce precision, or split.")
+            hc.append(f"{tbl}[{col}] (~{card:,})")
+    if hc:
+        add("MEDIUM", "high_cardinality", "High-cardinality columns",
+            f"{len(hc)} column(s) exceed {HIGH_CARD_WARN:,} distinct values: {', '.join(hc)}.", "")
 
-    # 7. wide tables ----------------------------------------------------------
+    # 7. wide tables (grouped)
     col_counts = {}
     for c in model.get("schema", []):
         t = _get(c, "tablename", "table", default="?")
         col_counts[t] = col_counts.get(t, 0) + 1
-    for t, n in col_counts.items():
-        if n >= 40 and not AUTO_TABLE_RE.match(t):
-            add("MEDIUM", "wide_table",
-                f"Very wide table: {t} ({n} columns)",
-                "Wide tables (esp. free-text/duplicate columns) dominate cache size. "
-                "Remove unused columns; run VertiPaq Analyzer to find the largest.")
+    wide = [f"{t} ({n} cols)" for t, n in col_counts.items() if n >= 40 and not AUTO_TABLE_RE.match(t)]
+    if wide:
+        add("MEDIUM", "wide_table", "Very wide tables",
+            f"{len(wide)} table(s) with 40+ columns: {', '.join(wide)}.", "")
 
-    # 8. report: slicers / visuals per page -----------------------------------
+    # 8/9. report side + cross-cutting
     used_tables = set()
     for pg in report.get("pages", []):
         vis = pg.get("visuals", [])
-        slicers = [v for v in vis if v.get("type") == "slicer"]
         for v in vis:
             used_tables.update(v.get("tables", []))
+        slicers = [v for v in vis if v.get("type") == "slicer"]
         if len(slicers) >= SLICER_WARN:
-            add("HIGH", "slicer_overload",
-                f"Many slicers on page '{pg.get('name')}'",
-                f"{len(slicers)} slicers - each queries on load and re-queries on every "
-                "interaction. Reduce, use the filter pane, or limit cross-interactions.")
+            add("HIGH", "slicer_overload", f"Slicer overload on page '{pg.get('name')}'",
+                f"{len(slicers)} slicers on a single page.",
+                "Each slicer queries on load and re-queries on every interaction - a primary interactive-CU driver.")
         if len(vis) >= VISUALS_WARN:
-            add("MEDIUM", "visual_overload",
-                f"Many visuals on page '{pg.get('name')}'",
-                f"{len(vis)} visuals on one page - each issues its own query at render.")
-
-    # 9. loaded-but-unused tables (needs both model + report) -----------------
+            add("MEDIUM", "visual_overload", f"High visual count on page '{pg.get('name')}'",
+                f"{len(vis)} visuals on a single page.",
+                "Each visual issues at least one query per render, multiplying query load on open and filter.")
     if user_tables and report.get("pages"):
         unused = [t for t in user_tables if t not in used_tables]
         if unused:
-            add("HIGH", "unused_loaded_tables",
-                "Tables loaded but used by zero visuals",
-                f"{len(unused)} table(s) not referenced by any visual: "
-                f"{', '.join(unused[:8])}{'...' if len(unused) > 8 else ''}. "
-                "If they only feed Power Query merges, set Enable load = off "
-                "(connection-only) to drop the duplicate storage.")
+            add("HIGH", "unused_loaded_tables", "Tables loaded but unused by any visual",
+                f"{len(unused)} loaded table(s) referenced by zero visuals: "
+                f"{', '.join(unused[:8])}{'...' if len(unused) > 8 else ''}.",
+                "Storing data no visual consumes inflates the cache and refresh; likely staging tables that should be connection-only.")
 
-    order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    findings.sort(key=lambda f: order.get(f["severity"], 9))
+    findings.sort(key=lambda f: SEV_ORDER.get(f["severity"], 9))
+    for i, f in enumerate(findings, 1):
+        f["id"] = f"F-{i:02d}"
     return findings
 
 
 # --------------------------------------------------------------------------- #
-#  Rendering                                                                  #
+#  CONSULTANT-STYLE MARKDOWN REPORT                                           #
 # --------------------------------------------------------------------------- #
-def render_findings_md(name, model, report, findings):
-    L = [f"# Performance findings - {name}\n"]
-    if model.get("error"):
-        L.append(f"> **Model extraction note:** {model['error']}\n")
-    L.append(f"- Tables: {len([t for t in model.get('tables', []) if not AUTO_TABLE_RE.match(t)])} "
-             f"user (+{len([t for t in model.get('tables', []) if AUTO_TABLE_RE.match(t)])} auto)")
-    L.append(f"- Measures: {len(model.get('dax_measures', []))}  ·  "
-             f"Calculated columns: {len(model.get('dax_columns', []))}  ·  "
-             f"Relationships: {len(model.get('relationships', []))}")
+def _bullets(text):
+    """Split a prose string into scannable bullet fragments on sentence/semicolon boundaries."""
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.;:])\s+(?=[A-Z(\"'~])", str(text).strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _md_table(headers, rows):
+    out = ["| " + " | ".join(headers) + " |",
+           "| " + " | ".join("---" for _ in headers) + " |"]
+    for r in rows:
+        out.append("| " + " | ".join(str(c).replace("|", "\\|").replace("\n", " ") for c in r) + " |")
+    return "\n".join(out)
+
+
+def _qual(table, col):
+    """Render a field as Table.Column dot notation, single-quoting any part with spaces/dots."""
+    def _clean(v):
+        if v is None:
+            return ""
+        try:
+            if v != v:          # NaN
+                return ""
+        except Exception:       # noqa: BLE001
+            pass
+        s = str(v).strip()
+        return "" if s.lower() == "nan" else s
+
+    table, col = _clean(table), _clean(col)
+    if not table:
+        return ""
+    t = f"'{table}'" if re.search(r"[\s.]", table) else table
+    if not col:
+        return t
+    c = f"'{col}'" if re.search(r"[\s.\[\]]", col) else col
+    return f"{t}.{c}"
+
+
+def _cardinality(r):
+    """Return (from_card, to_card) as 'one'/'many'. Defaults: from=many, to=one (TMDL default)."""
+    fc = str(_get(r, "fromcardinality", default="") or "").lower()
+    tc = str(_get(r, "tocardinality", default="") or "").lower()
+    combined = str(_get(r, "cardinality", default="") or "").lower()
+    if not fc and not tc and combined:
+        if "onetomany" in combined:
+            return "one", "many"
+        if "manytoone" in combined:
+            return "many", "one"
+        if "onetoone" in combined:
+            return "one", "one"
+        if "manytomany" in combined:
+            return "many", "many"
+    return (fc or "many"), (tc or "one")
+
+
+
+
+
+def _split_top(s, sep=","):
+    """Split on sep only at bracket depth 0."""
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if ch == sep and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur)
+    return out
+
+
+def _format_sql(sql):
+    """Pretty-print SQL for human reading. Uses sqlparse if available, else a light fallback."""
+    if not sql:
+        return ""
+    try:
+        import sqlparse
+        return sqlparse.format(sql, reindent=True, keyword_case="upper", indent_width=2).strip()
+    except Exception:                                       # noqa: BLE001
+        s = re.sub(r"\s+", " ", sql).strip()
+        for kw in ("LEFT JOIN", "RIGHT JOIN", "INNER JOIN", "FULL JOIN", "JOIN",
+                   "FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "UNION ALL", "UNION"):
+            s = re.sub(r"\s+" + kw.replace(" ", r"\s+") + r"\b", "\n" + kw, s, flags=re.I)
+        s = re.sub(r"\bAND\b", "\n  AND", s, flags=re.I)
+        s = re.sub(r",\s*", ",\n       ", s, count=0)
+        return s
+
+
+def _sql_cell(sql):
+    """Format SQL for display inside a Markdown table cell (HTML <code> + <br>)."""
+    f = _format_sql(sql)
+    if not f:
+        return ""
+    f = f.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "<code>" + f.replace("\n", "<br>") + "</code>"
+
+
+def _extract_sql(e):
+    """Pull the native SQL out of a Sql.Database([Query="..."]) M expression."""
+    m = re.search(r'Query\s*=\s*"(.+?)"\s*(?:,\s*CommandTimeout|\])', e, re.S)
+    if not m:
+        return ""
+    sql = m.group(1).replace('""', '"')
+    return re.sub(r"\s+", " ", sql).strip()
+
+
+
+def _inventories(model):
+    """Return (table_rows, rel_rows, measure_rows, calccol_rows, transform_rows)."""
+    col_counts = {}
+    for c in model.get("schema", []):
+        t = _get(c, "tablename", "table", default="?")
+        col_counts[t] = col_counts.get(t, 0) + 1
+    table_rows = sorted(
+        ([t, ("System generated" if AUTO_TABLE_RE.match(t) else "User"), n]
+         for t, n in col_counts.items()), key=lambda r: (-r[2], r[0]))
+
+    rel_rows = []
+    for r in model.get("relationships", []):
+        xf = str(_get(r, "crossfilteringbehavior", "crossfilter", default="")).strip() or "?"
+        ft = _get(r, "fromtable", "fromtablename", default="?")
+        tt = _get(r, "totable", "totablename", default="?")
+        fc = _get(r, "fromcolumn", "fromcolumnname", default="")
+        tc = _get(r, "tocolumn", "tocolumnname", default="")
+        fcard, tcard = _cardinality(r)
+        card_label = {("many", "one"): "Many : One", ("one", "many"): "One : Many",
+                      ("one", "one"): "One : One", ("many", "many"): "Many : Many"}.get(
+                          (fcard, tcard), f"{fcard.title()} : {tcard.title()}")
+        join = f"{_qual(ft, fc)} -> {_qual(tt, tc)}" if (fc or tc) else f"{ft} -> {tt}"
+        rel_rows.append([join, card_label, xf, ""])
+
+    measure_rows = [[_get(m, "tablename", "table", default="?"),
+                     _get(m, "name", "measurename", default="?"),
+                     "",
+                     _expr_text(m, "expression", "expr")] for m in model.get("dax_measures", [])]
+    calccol_rows = [[_get(c, "tablename", "table", default="?"),
+                     _get(c, "columnname", "name", default="?"),
+                     "",
+                     _expr_text(c, "expression", "expr")] for c in model.get("dax_columns", [])]
+
+    transform_rows = []
+    for p in model.get("power_query", []):
+        e = _expr_text(p, "expression", "expr")
+        t = _get(p, "tablename", "table", default="?")
+        logic = []
+        if "Sql.Database" in e:
+            logic.append("Native SQL")
+        if re.search(r"Table\.NestedJoin|Table\.ExpandTableColumn", e):
+            logic.append("M merge")
+        if re.search(r"_translated|'fr'", e, re.I):
+            logic.append("Translated/FR")
+        if "CommandTimeout" in e:
+            logic.append("CommandTimeout")
+        transform_rows.append([t, " + ".join(logic) or "Passthrough"])
+    return table_rows, rel_rows, measure_rows, calccol_rows, transform_rows
+
+
+def render_report_md(name, model, report, findings):
+    from datetime import date
+    user_t = [t for t in model.get("tables", []) if not AUTO_TABLE_RE.match(t)]
+    auto_t = [t for t in model.get("tables", []) if AUTO_TABLE_RE.match(t)]
     pages = report.get("pages", [])
     total_vis = sum(len(p.get("visuals", [])) for p in pages)
-    total_slc = sum(len([v for v in p.get('visuals', []) if v.get('type') == 'slicer']) for p in pages)
-    L.append(f"- Report: {len(pages)} page(s), {total_vis} visual(s), {total_slc} slicer(s)")
-    if report.get("error"):
-        L.append(f"- Report note: {report['error']}")
-    L.append("")
-    if not findings:
-        L.append("_No rule-based issues detected._")
+    total_slc = sum(len([v for v in p.get("visuals", []) if v.get("type") == "slicer"]) for p in pages)
+    sev_counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEV_ORDER}
+    size_mb = None
+    if isinstance(model.get("size_bytes"), (int, float)):
+        size_mb = f"{model['size_bytes'] / 1_048_576:.0f} MB"
+
+    L = []
+    L.append(f"# Power BI Performance Optimization Assessment")
+    L.append(f"### {name}")
+    L.append(f"_Prepared {date.today().isoformat()} · Confidential — for client review_\n")
+    L.append("---\n")
+
+    # 2. Scope & Methodology
+    L.append("## 2. Scope & Methodology\n")
+    L.append("**In scope:** the report's semantic model (tables, relationships, DAX measures and "
+             "calculated columns, Power Query/M) and its report layer (pages, visuals, field usage).\n")
+    L.append("**Out of scope:** upstream data-source / Gold-layer ETL internals, and capacity sizing "
+             "decisions, except where a recommendation explicitly pushes work upstream.\n")
+    L.append("**Method:** the model was parsed programmatically and the report definition read "
+             "directly (visual definitions and per-visual field references). No change has been "
+             "applied to the model as part of this assessment.\n")
+    L.append("---\n")
+
+    # 3. As-Is Baseline
+    L.append("## 3. As-Is Baseline\n")
+    base = [
+        ["Report", name],
+        ["User tables", len(user_t)],
+        ["Auto-generated (date) tables", len(auto_t)],
+        ["Total columns", len(model.get("schema", []))],
+        ["Measures", len(model.get("dax_measures", []))],
+        ["Calculated columns", len(model.get("dax_columns", []))],
+        ["Relationships", len(model.get("relationships", []))],
+        ["Model size", size_mb or "n/a (run VertiPaq Analyzer)"],
+        ["Report pages", len(pages)],
+        ["Visuals (all pages)", total_vis],
+        ["Slicers (all pages)", total_slc],
+    ]
+    L.append("\n**CU baseline (to be completed):**\n")
+    L.append(_md_table(["Metric", "Value"],
+             [["Interactive CU (avg/peak)", "[[ REPLACE — from Fabric Capacity Metrics app ]]"],
+              ["Background CU (avg/peak)", "[[ REPLACE — from Fabric Capacity Metrics app ]]"],
+              ["Refresh duration", "[[ REPLACE ]]"],
+              ["Throttling observed?", "[[ REPLACE — Yes/No ]]"]]))
+    L.append("\n> _Capture the interactive-vs-background split from the Capacity Metrics app to anchor "
+             "before/after measurement; telemetry lag (~15–60 min) and smoothing apply._\n")
+    L.append("---\n")
+
+    # 4. As-Is Architecture & Inventories
+    trow, rrow, mrow, crow, xrow = _inventories(model)
+    L.append("## 4. As-Is Inventories\n")
+    L.append("### 4.1 Table Inventory\n")
+    L.append(_md_table(["Table", "Type", "Columns"], trow) if trow else "_No schema data._")
+    L.append("\n### 4.2 Relationship Map\n")
+    L.append(_md_table(["Relationship (from → to)", "Cardinality", "Cross-filter", "Description"], rrow)
+             if rrow else "_No relationships._")
+    L.append("\n### 4.3 Measures\n")
+    L.append(_md_table(["Table", "Measure", "Description", "Expression"],
+             [[r[0], r[1], r[2], f"`{r[3]}`"] for r in mrow]) if mrow else "_No measures._")
+    L.append("\n### 4.4 Calculated Columns\n")
+    L.append(_md_table(["Table", "Column", "Description", "Expression"],
+             [[r[0], r[1], r[2], f"`{r[3]}`"] for r in crow]) if crow else "_No calculated columns._")
+    L.append("\n### 4.5 Transformation Inventory\n")
+    if xrow:
+        L.append("_Logic tags: **Native SQL** = query sent to the source; **M merge** = joins done "
+                 "locally in Power Query (do not fold); **Translated/FR** = calls translated('fr') for "
+                 "bilingual columns; **CommandTimeout** = extended source-query timeout set._\n")
+        sqlmap = {_get(p, "tablename", "table", default="?"):
+                  _sql_cell(_extract_sql(_expr_text(p, "expression", "expr")))
+                  for p in model.get("power_query", [])}
+        rows = [[t, logic, sqlmap.get(t, "")] for (t, logic) in xrow]
+        L.append(_md_table(["Table", "Logic", "Source SQL"], rows))
     else:
-        L.append(f"## {len(findings)} finding(s)\n")
-        for f in findings:
-            L.append(f"### [{f['severity']}] {f['title']}")
-            L.append(f"{f['detail']}\n")
+        L.append("_No partition expressions._")
+    L.append("\n---\n")
+
+    # 5. Findings
+    L.append("## 5. Findings\n")
+    if not findings:
+        L.append("_No rule-based issues detected._\n")
+    for f in findings:
+        L.append(f"### {f['id']} · {f['title']}")
+        L.append(_md_table(["Severity", "Category", "Owning layer"],
+                 [[f["severity"], f["category"], f["layer"]]]))
+        L.append("\n**Evidence**")
+        for b in _bullets(f["evidence"]):
+            L.append(f"- {b}")
+        L.append("\n**Impact**")
+        for b in _bullets(f["impact"]):
+            L.append(f"- {b}")
+        L.append("\n**Recommendation**")
+        for b in _bullets(f["recommendation"]):
+            L.append(f"- {b}")
+        L.append("")
+    L.append("---\n")
+
+    # 6. Recommendations
+    L.append("## 6. Recommendations\n")
+    rec_rows = [[f["id"], f["recommendation"], f["layer"], f["effort"], f["risk"], f"P{f['phase']}"]
+                for f in findings]
+    L.append(_md_table(["Finding", "Recommendation", "Layer", "Effort", "Risk", "Phase"], rec_rows)
+             if rec_rows else "_None._")
+    L.append("\n---\n")
+
+    # 7. Prioritization
+    L.append("## 7. Prioritization\n")
+    qw = [f for f in findings if f["phase"] == 1]
+    st = [f for f in findings if f["phase"] != 1]
+    L.append("### 7.1 Quick wins (safe, do now)\n")
+    L.append(_md_table(["Finding", "Action", "Effort", "Risk"],
+             [[f["id"], f["recommendation"], f["effort"], f["risk"]] for f in qw]) if qw else "_None._")
+    L.append("\n### 7.2 Strategic (design / source work)\n")
+    L.append(_md_table(["Finding", "Action", "Effort", "Risk"],
+             [[f["id"], f["recommendation"], f["effort"], f["risk"]] for f in st]) if st else "_None._")
+    L.append("\n---\n")
+
+    # 8. To-Be
+    L.append("## 8. Proposed To-Be State\n")
+    seen = set()
+    for f in findings:
+        if f["tobe"] and f["tobe"] not in seen:
+            seen.add(f["tobe"])
+            L.append(f"- {f['tobe']}")
+    L.append("\n---\n")
+
+    # 9. Validation
+    L.append("## 9. Validation & Measurement Plan\n")
+    L.append("- **Model size:** VertiPaq Analyzer (DAX Studio) — capture total and per-column size before "
+             "and after each change.\n"
+             "- **Query/render time:** Performance Analyzer on the heaviest page — record DAX query "
+             "durations before and after.\n"
+             "- **Capacity (CU):** Fabric Capacity Metrics app — compare interactive vs background CU for "
+             "the model's operations, allowing for telemetry lag and smoothing.\n"
+             "- **Regression:** confirm visual outputs and slicer behaviour are unchanged after each fix.\n")
+    L.append("---\n")
+
+    # 10. Roadmap
+    L.append("## 10. Roadmap\n")
+    L.append("- **Phase 1 — Quick wins (no source changes):** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 1) or "—") + "\n"
+             "- **Phase 2 — Source / model rework:** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 2) or "—") + "\n"
+             "- **Phase 3 — Report redesign:** "
+             + (", ".join(f["id"] for f in findings if f["phase"] == 3) or "—") + "\n")
+    L.append("---\n")
+
+    # 11. Appendix
+    L.append("## 11. Appendix\n")
+    if model.get("error"):
+        L.append(f"- **Model extraction note:** {model['error']}")
+    if report.get("error"):
+        L.append(f"- **Report extraction note:** {report['error']}")
+    L.append("- **Glossary:** CU = Capacity Unit; VertiPaq = the in-memory columnar storage engine; "
+             "query folding = pushing Power Query steps to the source as native SQL; interactive CU = "
+             "cost of querying/rendering; background CU = cost of refresh.")
+    L.append("")
     return "\n".join(L)
 
 
 # --------------------------------------------------------------------------- #
+
+
 def process_one(pbix_path, out_dir, report_only=None):
+    """Analyse one .pbix and write its own .assessment.md.
+    Returns a summary dict (never raises - failures are captured)."""
     name = Path(pbix_path).stem
-    model = extract_model(pbix_path)
-    report = extract_visuals(report_only) if report_only else extract_visuals(pbix_path)
-    findings = detect(model, report)
-
-    facts = {"name": name, "model": model, "report": report}
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{name}.facts.json").write_text(
-        json.dumps(facts, indent=2, default=str), encoding="utf-8")
-    (out_dir / f"{name}.findings.md").write_text(
-        render_findings_md(name, model, report, findings), encoding="utf-8")
+    try:
+        model = extract_model(pbix_path)
+        report = extract_visuals(report_only) if report_only else extract_visuals(pbix_path)
+        findings = detect(model, report)
 
-    sev_counts = {}
-    for f in findings:
-        sev_counts[f["severity"]] = sev_counts.get(f["severity"], 0) + 1
-    print(f"  {name}: {len(findings)} findings "
-          f"({', '.join(f'{k}={v}' for k, v in sev_counts.items()) or 'none'})")
-    return findings
+        (out_dir / f"{name}.assessment.md").write_text(
+            render_report_md(name, model, report, findings), encoding="utf-8")
+
+        sev = {}
+        for f in findings:
+            sev[f["severity"]] = sev.get(f["severity"], 0) + 1
+        print(f"  [OK]  {name}: {len(findings)} findings "
+              f"({', '.join(f'{k}={v}' for k, v in sev.items()) or 'none'}) -> {name}.assessment.md")
+        return {"name": name, "status": "ok", "findings": len(findings),
+                "critical": sev.get("CRITICAL", 0), "high": sev.get("HIGH", 0),
+                "medium": sev.get("MEDIUM", 0), "low": sev.get("LOW", 0),
+                "model_error": model.get("error", ""), "report_error": report.get("error", "")}
+    except Exception as e:                                   # noqa: BLE001 - keep the batch alive
+        print(f"  [FAIL] {name}: {e}")
+        return {"name": name, "status": "failed", "findings": 0,
+                "critical": 0, "high": 0, "medium": 0, "low": 0, "error": str(e)}
+
+
+def write_index(out_dir, summaries):
+    """Roll-up index across all reports in a batch."""
+    from datetime import date
+    rows = []
+    for s in sorted(summaries, key=lambda x: (-x.get("critical", 0), -x.get("high", 0), x["name"])):
+        link = f"[{s['name']}]({s['name']}.assessment.md)" if s["status"] == "ok" else s["name"]
+        note = s.get("error") or s.get("model_error") or "-"
+        rows.append([link, s["status"], s["findings"], s.get("critical", 0),
+                     s.get("high", 0), s.get("medium", 0), s.get("low", 0), note])
+    ok = sum(1 for s in summaries if s["status"] == "ok")
+    failed = sum(1 for s in summaries if s["status"] == "failed")
+    L = ["# Power BI Portfolio Assessment - Index",
+         f"_Prepared {date.today().isoformat()} · {len(summaries)} report(s): {ok} succeeded, {failed} failed_\n",
+         _md_table(["Report", "Status", "Findings", "Crit", "High", "Med", "Low", "Note"], rows),
+         "\nEach report has its own `<name>.assessment.md` (full detail) and `<name>.facts.json` (raw facts)."]
+    (out_dir / "INDEX.md").write_text("\n".join(L), encoding="utf-8")
+    print(f"  Index: INDEX.md ({ok} ok, {failed} failed)")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Extract perf facts + findings from .pbix file(s).")
+    ap = argparse.ArgumentParser(description="Extract perf facts + a consultant-style assessment from .pbix file(s).")
     ap.add_argument("path", help="A .pbix file, OR a folder containing .pbix files.")
     ap.add_argument("-o", "--out", default="perf_out", help="Output folder (default: perf_out)")
+    ap.add_argument("-r", "--recursive", action="store_true",
+                    help="Recurse into subfolders when a folder is given.")
     ap.add_argument("--report-only", help="Read visuals from this extracted Report/PBIP folder "
-                                           "instead of the .pbix (model still from the .pbix).")
+                                          "instead of the .pbix (model still from the .pbix).")
     args = ap.parse_args()
 
     p = Path(args.path)
     out = Path(args.out)
+
     if p.is_dir() and not args.report_only:
-        pbix = sorted(p.glob("*.pbix"))
+        pbix = sorted(p.rglob("*.pbix") if args.recursive else p.glob("*.pbix"))
         if not pbix:
-            print("No .pbix files found in folder.")
+            where = "folder tree" if args.recursive else "folder"
+            print(f"No .pbix files found in {where}: {p}")
             sys.exit(1)
-        print(f"Scanning {len(pbix)} file(s)...")
-        for f in pbix:
-            process_one(f, out)
+        print(f"Scanning {len(pbix)} .pbix file(s) in {p}{' (recursive)' if args.recursive else ''}...")
+        summaries = [process_one(f, out) for f in pbix]
+        write_index(out, summaries)
     else:
         print("Scanning 1 file...")
         process_one(p, out, report_only=args.report_only)
-    print(f"Done. Facts + findings written to: {out}/")
+    print(f"Done. Output written to: {out}/")
 
 
 if __name__ == "__main__":
