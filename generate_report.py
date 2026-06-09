@@ -358,13 +358,6 @@ CATALOG = {
             "rolling partition policy. Requires a reliable source watermark.",
         effort="M", risk="Medium", layer="Model / Source", phase=2,
         tobe="Only changed partitions refresh; background CU scales with change rate."),
-    "dev_server": dict(
-        category="Governance",
-        verified="Scanned connection parameters for 'dev' source references.",
-        recommendation="Re-point the source to QA/Prod before establishing baselines.",
-        how="Update the Server/Database parameter to the governed source; validate row counts.",
-        effort="S", risk="Low", layer="Governance", phase=2,
-        tobe="Reports sourced from a governed, representative environment."),
     "high_cardinality": dict(
         category="Storage / Model",
         verified="Read per-column cardinality from the decoded VertiPaq statistics.",
@@ -451,9 +444,6 @@ IMPACTS = {
     "no_incremental":
         "Without incremental refresh every refresh reloads all rows from all tables regardless of what "
         "changed — background CU is spent reprocessing unchanged history every cycle.",
-    "dev_server":
-        "Sourcing from a dev environment yields unreliable performance baselines (dev is not sized for "
-        "production load) and risks shipping a report pointed at non-governed data.",
     "high_cardinality":
         "High-cardinality columns have large dictionaries and compress poorly, so they are typically the "
         "biggest contributors to model size and to scan cost at query time.",
@@ -541,30 +531,37 @@ def detect(model, report):
             "Bi-directional filtering forces propagation in both directions per query and can create "
             "ambiguous filter paths - elevated interactive CU, especially with many slicers.")
 
-    # 3. calculated columns
+    # 3. calculated columns (grouped: one finding per type, listing all columns)
     agg_re = re.compile(r"\b(CALCULATE|RELATEDTABLE|SUMX|AVERAGEX|COUNTX|COUNTROWS|FILTER)\b", re.I)
     label_re = re.compile(r"\b(SWITCH|IF)\b", re.I)
+    agg_cols, label_cols = [], []
     for c in model.get("dax_columns", []):
         expr = _expr_text(c, "expression", "expr")
         name = _get(c, "columnname", "name", "column", default="?")
         tbl = _get(c, "tablename", "table", default="?")
+        if AUTO_TABLE_RE.match(str(tbl)):
+            continue
         if agg_re.search(expr):
-            add("HIGH", "calc_col_agg", f"Expensive calculated column: {tbl}[{name}]",
-                f"Column DAX uses {agg_re.search(expr).group(0).upper()} to aggregate/scan another table, "
-                "evaluated per row at refresh and stored.",
-                "Per-row cross-table evaluation lengthens refresh and adds a stored column to the cache.")
+            agg_cols.append(f"{tbl}[{name}]")
         elif label_re.search(expr):
-            add("MEDIUM", "calc_col_label", f"Static-label calculated column: {tbl}[{name}]",
-                "Column DAX is a row-level SWITCH/IF label that never reacts to filters.",
-                "Computed and stored in-model every refresh although it is a static source attribute.")
+            label_cols.append(f"{tbl}[{name}]")
+    if agg_cols:
+        add("HIGH", "calc_col_agg", "Expensive calculated columns (cross-table aggregation)",
+            f"{len(agg_cols)} calculated column(s) aggregate or scan another table, evaluated per row at "
+            f"refresh and stored: {', '.join(agg_cols)}.", "")
+    if label_cols:
+        add("MEDIUM", "calc_col_label", "Static-label calculated columns",
+            f"{len(label_cols)} row-level SWITCH/IF label column(s) that never react to filters: "
+            f"{', '.join(label_cols)}.", "")
 
-    # 4. measures
-    for me in model.get("dax_measures", []):
-        if re.search(r"IF\s*\(\s*ISBLANK", _expr_text(me, "expression", "expr"), re.I):
-            nm = _get(me, "name", "measurename", default="?")
-            add("LOW", "measure_blank", f"Measure double-evaluates: {nm}",
-                "Measure uses IF(ISBLANK(<agg>), 0, <agg>), evaluating the aggregation twice.",
-                "Negligible CU; a maintainability/readability issue.")
+    # 4. measures (grouped)
+    blank_measures = [_get(me, "name", "measurename", default="?")
+                      for me in model.get("dax_measures", [])
+                      if re.search(r"IF\s*\(\s*ISBLANK", _expr_text(me, "expression", "expr"), re.I)]
+    if blank_measures:
+        add("LOW", "measure_blank", "Measures double-evaluate (IF(ISBLANK(...)))",
+            f"{len(blank_measures)} measure(s) wrap an aggregation in IF(ISBLANK(...)), evaluating it "
+            f"twice: {', '.join(blank_measures)}.", "")
 
     # 5. Power Query / source
     pq = [(_get(p, "tablename", "table", default="?"), _expr_text(p, "expression", "expr"))
@@ -573,10 +570,6 @@ def detect(model, report):
     fr_tbls = sorted({t for t, e in pq if re.search(r"_translated|'fr'|-\s*FR", e, re.I)})
     timeout_n = sum(1 for _, e in pq if "CommandTimeout" in e)
     has_range = any("RangeStart" in e for _, e in pq)
-    dev_hits = sorted({t for t, e in pq if "dev" in e.lower()} |
-                      {_get(p, "parametername", "name", default="param")
-                       for p in model.get("m_parameters", [])
-                       if "dev" in _expr_text(p, "expression", "value", "expr").lower()})
     if merge_tbls:
         add("MEDIUM", "m_merge", "Client-side merges in Power Query (no folding)",
             f"NestedJoin/ExpandTableColumn present in: {', '.join(merge_tbls[:6])}.",
@@ -618,12 +611,9 @@ def detect(model, report):
         add("HIGH", "no_incremental", "No incremental refresh configured",
             "No RangeStart/RangeEnd parameters found in any partition.",
             "Every refresh reloads all rows from all tables - background CU spent on unchanged data.")
-    if dev_hits:
-        add("MEDIUM", "dev_server", "Source points at a dev environment",
-            f"'dev' appears in: {', '.join(map(str, dev_hits[:6]))}.",
-            "Dev sources are not sized for production; performance baselines drawn from them are unreliable.")
 
-    # 6. cardinality
+    # 6. cardinality (grouped)
+    hc = []
     for s in model.get("statistics", []):
         card = _get(s, "cardinality", "count", default=None)
         col = _get(s, "columnname", "column", default=None)
@@ -633,20 +623,20 @@ def detect(model, report):
         except (TypeError, ValueError):
             card = None
         if card and card > HIGH_CARD_WARN and col:
-            add("MEDIUM", "high_cardinality", f"High-cardinality column: {tbl}[{col}]",
-                f"Approximately {card:,} distinct values.",
-                "High-cardinality columns compress poorly and are typically the largest contributors to model size.")
+            hc.append(f"{tbl}[{col}] (~{card:,})")
+    if hc:
+        add("MEDIUM", "high_cardinality", "High-cardinality columns",
+            f"{len(hc)} column(s) exceed {HIGH_CARD_WARN:,} distinct values: {', '.join(hc)}.", "")
 
-    # 7. wide tables
+    # 7. wide tables (grouped)
     col_counts = {}
     for c in model.get("schema", []):
         t = _get(c, "tablename", "table", default="?")
         col_counts[t] = col_counts.get(t, 0) + 1
-    for t, n in col_counts.items():
-        if n >= 40 and not AUTO_TABLE_RE.match(t):
-            add("MEDIUM", "wide_table", f"Very wide table: {t} ({n} columns)",
-                f"{t} carries {n} columns.",
-                "Width (not row count) drives cache size; wide tables with free-text/duplicate columns dominate storage.")
+    wide = [f"{t} ({n} cols)" for t, n in col_counts.items() if n >= 40 and not AUTO_TABLE_RE.match(t)]
+    if wide:
+        add("MEDIUM", "wide_table", "Very wide tables",
+            f"{len(wide)} table(s) with 40+ columns: {', '.join(wide)}.", "")
 
     # 8/9. report side + cross-cutting
     used_tables = set()
@@ -847,26 +837,6 @@ def render_report_md(name, model, report, findings):
     L.append(f"# Power BI Performance Optimization Assessment")
     L.append(f"### {name}")
     L.append(f"_Prepared {date.today().isoformat()} · Confidential — for client review_\n")
-    L.append("---\n")
-
-    # 1. Executive Summary
-    L.append("## 1. Executive Summary\n")
-    L.append("This assessment reviews the semantic model and report layer of the subject report to "
-             "identify the drivers of elevated capacity (CU) consumption and to recommend prioritised, "
-             "evidence-based remediations. Findings are derived directly from the model and report "
-             "definition; impact is characterised structurally and is to be confirmed by measurement "
-             "(Section 9).\n")
-    L.append(_md_table(["Severity", "Findings"],
-             [[s.title(), sev_counts[s]] for s in SEV_ORDER] + [["**Total**", len(findings)]]))
-    L.append("")
-    quick = [f for f in findings if f["phase"] == 1]
-    if quick:
-        L.append("**Recommended immediate actions (low-risk quick wins):**\n")
-        for f in quick:
-            L.append(f"- **{f['id']} — {f['recommendation']}** ({f['effort']} effort, {f['risk']} risk)")
-        L.append("")
-    L.append("**Expected outcome:** reduced model size and refresh cost (background CU), faster page "
-             "render and interaction (interactive CU), and a simpler, more maintainable model.\n")
     L.append("---\n")
 
     # 2. Scope & Methodology
